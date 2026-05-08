@@ -1,0 +1,23 @@
+### IntelliJ IDEA ##
+.idea
+
+### Mac OS ###
+.DS_Store
+
+### venv ###
+.venv
+
+### practice ###
+practice
+
+### logs ###
+logs
+
+### secrets ###
+.env
+
+### data cache (large CSV files) ###
+data_cache/
+
+### bot pid ###
+*.pid
