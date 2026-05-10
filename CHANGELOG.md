@@ -1,5 +1,24 @@
 # ChangeLog
 
+## 2026-05
+
+- [매매전략 추가](/backtest_short_term_5m.py)
+- 5분봉 백테스트 엔진에 `vwap_pullback` 진입 신호 추가
+  - Rolling VWAP 기준가 계산
+  - 최근 N봉 내 VWAP 터치 여부 확인
+  - VWAP 상단 회복, 양봉, 거래량 필터를 결합한 눌림목 진입 후보 검증
+- [최적화 스크립트 추가](/optimize_xrp_vwap_pullback.py)
+  - XRP VWAP 눌림목 전략의 VWAP 윈도우, 터치 lookback, 거래량 배수, TP/SL, 보유시간 그리드 탐색
+- [최적화 스크립트 추가](/optimize_xrp_trend_pullback.py)
+  - XRP EMA 눌림목 전략의 EMA 조합, 기울기 lookback, TP/SL, trailing ATR, TP1 그리드 탐색
+- [최적화 스크립트 추가](/optimize_xrp_more_trades.py)
+  - XRP 변동성 돌파 전략의 거래 빈도 증가를 위한 세션, 요일, 변동성/거래량 임계값 완화 후보 탐색
+- [최적화/검증 스크립트 추가](/optimize_per_market.py), [검증](/validate_per_market.py)
+  - ETH/BTC 시장별 변동성 돌파 winner 후보 탐색 및 train/test 일관성 검증
+- [알림 개선](/main_xrp_night.py)
+  - XRP 단일 야간 봇의 자산현황 알림을 매분에서 매시간으로 변경
+  - 포지션, 주요 가격 레벨, PnL, 자산현황, 진입 신호 근접도를 상세 표시
+
 ## 2025-03
 
 - [매매전략 추가](/trading/bollinger_band_breakout.py)

@@ -53,6 +53,8 @@ TP1_PCT       = 1.2
 TP1_RATIO     = 0.7
 MIN_ORDER_KRW = 5_000
 
+_last_status_hour: int = -1   # 마지막으로 자산현황을 보낸 시각(hour)
+
 # ── 로그 설정 ──────────────────────────────────────────────────────────────
 _log_dir = os.path.join(_dir, "logs")
 if not os.path.exists(_log_dir):
@@ -185,25 +187,63 @@ def _check_order(res: pd.DataFrame) -> tuple[bool, str]:
 def _status_msg(now: datetime, account: dict, state: dict,
                 cur_price: float, indic: dict) -> str:
     ts = now.strftime("%Y-%m-%d %H:%M:%S")
-    lines = [f"[KRW-XRP] {ts}"]
+    lines = [f"📊 [KRW-XRP 시간현황] {ts}"]
 
     if account["has_xrp"]:
         buy_price = state.get("buy_price") or account["xrp_avg_price"]
         tp1_taken = bool(state.get("tp1_taken", False))
         hold_bars = hold_bars_elapsed(state.get("buy_time"), now)
-        pnl       = (cur_price / buy_price - 1) * 100 if buy_price > 0 else 0.0
+        xrp_qty   = float(account["xrp_balance"])
+        pnl_pct   = (cur_price / buy_price - 1) * 100 if buy_price > 0 else 0.0
+        pnl_krw   = (cur_price - buy_price) * xrp_qty if buy_price > 0 else 0.0
+        xrp_value = xrp_qty * cur_price
+        total_est = xrp_value + account["krw_balance"]
+        hold_h    = hold_bars * 5 // 60
+        hold_m    = hold_bars * 5 % 60
+        sl_price  = buy_price * (1.0 - STOP_LOSS / 100.0)
+        tp1_price = buy_price * (1.0 + TP1_PCT / 100.0)
+        tp_price  = buy_price * (1.0 + TAKE_PROFIT / 100.0)
 
-        lines.append("포지션: LONG")
-        lines.append(f"현재가: {cur_price:,.0f}원  매수가: {buy_price:,.0f}원")
-        lines.append(f"PnL: {pnl:+.2f}%  보유봉: {hold_bars}/{MAX_HOLD_BARS}")
-        lines.append(f"TP1: {'완료' if tp1_taken else '대기'}")
-        lines.append(f"XRP: {float(account['xrp_balance']):.4f}")
+        lines.append("▶ 포지션: LONG")
+        lines.append(f"현재가:  {cur_price:,.2f}원")
+        lines.append(f"매수가:  {buy_price:,.2f}원")
+        lines.append(f"PnL:    {pnl_pct:+.2f}%  ({pnl_krw:+,.0f}원)")
+        lines.append(f"보유봉:  {hold_bars}/{MAX_HOLD_BARS}봉  ({hold_h}h {hold_m}m)")
+        lines.append(f"XRP수량: {xrp_qty:.4f} XRP")
+        lines.append("")
+        lines.append("── 주요 가격 레벨 ──")
+        lines.append(f"손절:   {sl_price:,.2f}원  (-{STOP_LOSS}%)")
+        if not tp1_taken:
+            lines.append(f"TP1:    {tp1_price:,.2f}원  (+{TP1_PCT}%, {TP1_RATIO*100:.0f}% 부분익절)")
+        else:
+            lines.append(f"TP1:    완료 ✓")
+        lines.append(f"익절:   {tp_price:,.2f}원  (+{TAKE_PROFIT}%)")
+        lines.append("")
+        lines.append("── 자산현황 ──")
+        lines.append(f"XRP평가: {xrp_value:,.0f}원")
+        lines.append(f"KRW잔고: {account['krw_balance']:,.0f}원")
+        lines.append(f"총평가:  {total_est:,.0f}원")
     else:
-        lines.append("포지션: 없음")
-        lines.append(f"현재가: {cur_price:,.0f}원")
-        lines.append(f"bt={indic['bt']:,.0f}  vol={indic['vol_ratio']:.2f}")
+        in_session = passes_filter(now)
+        session_str = "✅ 진입가능 (kr_night+평일)" if in_session else "⏸ 세션 외"
+        bt = indic["bt"]
+        vol_ratio = indic["vol_ratio"]
+        bt_gap_pct = (bt / cur_price - 1) * 100 if cur_price > 0 else 0.0
 
-    lines.append(f"KRW: {account['krw_balance']:,.0f}원")
+        lines.append("▶ 포지션: 없음")
+        lines.append(f"세션:    {session_str}")
+        lines.append(f"현재가:  {cur_price:,.2f}원")
+        lines.append("")
+        lines.append("── 진입 신호 근접도 ──")
+        lines.append(f"돌파임계: {bt:,.2f}원  (현재가 대비 {bt_gap_pct:+.2f}%)")
+        lines.append(f"거래량비: {vol_ratio:.2f}x  (기준 {VOL_MULT}x)")
+        vol_bar = "🟢" if vol_ratio >= VOL_MULT else "🔴"
+        price_bar = "🟢" if cur_price > bt else "🔴"
+        lines.append(f"가격돌파: {price_bar}  거래량: {vol_bar}")
+        lines.append("")
+        lines.append("── 자산현황 ──")
+        lines.append(f"KRW잔고: {account['krw_balance']:,.0f}원")
+
     return "\n".join(lines)
 
 
@@ -238,8 +278,11 @@ def auto_trading() -> None:
         indic   = compute_indicators(candles)
         cur_price = indic["close"]
 
-        # ── 매분 자산현황 알림 ──────────────────────────────────────────────
-        send_telegram(_status_msg(now, account, state, cur_price, indic))
+        # ── 매시간 자산현황 알림 ────────────────────────────────────────────
+        global _last_status_hour
+        if now.hour != _last_status_hour:
+            send_telegram(_status_msg(now, account, state, cur_price, indic))
+            _last_status_hour = now.hour
 
         # ── 5분봉 경계에서만 트레이딩 로직 실행 ────────────────────────────
         if now.minute % 5 != 0:

@@ -44,6 +44,9 @@ VALID_ATR_MULTS_V2 = [0.5, 1.0, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 2.0, 2.5]
 VALID_ATR_WINDOWS        = [10, 14, 21]
 VALID_VOL_BASELINES      = [10, 20, 30, 50]
 VALID_BREAKOUT_LOOKBACKS = [10, 20, 40]
+# VWAP pullback 파라미터 유효값
+VALID_VWAP_WINDOWS       = [48, 96, 288]   # 4h / 8h / 24h (5분봉 기준)
+VALID_VWAP_LOOKBACKS     = [3, 5, 10]      # 최근 N봉 내 VWAP 터치 검사
 
 
 @dataclass(frozen=True)
@@ -74,6 +77,10 @@ class ShortTermParams:
     # Partial TP Ladder (v3)
     tp1_pct: float = 0.0    # 1차 부분 익절 수준 % (0 = 비활성)
     tp1_ratio: float = 0.5  # 1차 익절 시 매도할 포지션 비율 (0.5 = 50%)
+    # VWAP pullback 파라미터
+    vwap_window: int = 96            # rolling VWAP 윈도우 (48=4h / 96=8h / 288=24h)
+    vwap_pullback_lookback: int = 5  # 최근 N봉 내 low가 VWAP 터치 검사
+    vwap_volume_mult: float = 1.0    # 거래량 확인 배수 (volume / Volume_MA20)
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +188,25 @@ def build_short_term_context(prepared_df: pd.DataFrame) -> dict[str, Any]:
             "pullback_5":     pullback_5,
         }
 
+    # ── VWAP pullback 시그널 배열 ────────────────────────────────────────
+    # rolling VWAP = sum(close*volume) / sum(volume) over W bars
+    pv = df["close"] * df["volume"]
+    vwap_arrays: dict[int, np.ndarray] = {}
+    vwap_touched_recent: dict[tuple[int, int], np.ndarray] = {}
+    for _w in VALID_VWAP_WINDOWS:
+        _vwap = (
+            pv.rolling(_w, min_periods=20).sum()
+            / df["volume"].rolling(_w, min_periods=20).sum()
+        )
+        vwap_arrays[_w] = _vwap.to_numpy(dtype=float)
+        # 직전봉이 VWAP 터치 (low <= vwap)했는지를 최근 K봉 내에서 검사
+        _touched = (df["low"] <= _vwap).fillna(False)
+        for _k in VALID_VWAP_LOOKBACKS:
+            vwap_touched_recent[(_w, _k)] = (
+                _touched.shift(1).rolling(_k, min_periods=1).max()
+                .fillna(0).astype(bool).to_numpy()
+            )
+
     # ── 평균 회귀 시그널 배열 (RSI / BB) ──────────────────────────────────
     rsi14 = _calculate_rsi(close, window=14)
 
@@ -231,6 +257,9 @@ def build_short_term_context(prepared_df: pd.DataFrame) -> dict[str, Any]:
         "rsi_recent_under_35": _rsi_recent_under(35),
         "prev_below_bb_20":    _prev_below_bb(2.0),
         "prev_below_bb_25":    _prev_below_bb(2.5),
+        # VWAP pullback
+        "vwap_arrays":         vwap_arrays,
+        "vwap_touched_recent": vwap_touched_recent,
         # buy_and_hold 기준값 (검증용)
         "first_open":     float(open_arr[0]),
         "last_close":     float(close_arr[-1]),
@@ -293,6 +322,16 @@ def run_short_term_backtest(
         & (context["vol_ratio_arrays"][params.volume_baseline_window] >= params.breakout_volume_mult)
     ) & time_filter
 
+    # VWAP pullback signal
+    vwap_arr = context["vwap_arrays"][params.vwap_window]
+    vwap_touched = context["vwap_touched_recent"][(params.vwap_window, params.vwap_pullback_lookback)]
+    vwap_signal = (
+        (close > vwap_arr)
+        & vwap_touched
+        & context["is_bullish"]
+        & (context["vol_ratio_arrays"][params.volume_baseline_window] >= params.vwap_volume_mult)
+    ) & time_filter
+
     kind = params.entry_kind
     if kind == "trend_pullback":
         entry_signal = trend_signal
@@ -300,6 +339,8 @@ def run_short_term_backtest(
         entry_signal = mean_rev_signal
     elif kind == "volatility_breakout":
         entry_signal = vol_signal
+    elif kind == "vwap_pullback":
+        entry_signal = vwap_signal
     elif kind == "combo_or":
         entry_signal = trend_signal | mean_rev_signal | vol_signal
     else:
