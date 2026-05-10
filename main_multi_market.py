@@ -50,7 +50,6 @@ class MarketConfig:
     asset: str            # "XRP"
     label: str            # 화면 표시용
     state_file: Path
-    max_buy_krw: int      # 한 시장 단일 매수 최대 KRW
     # 시그널 (volatility_breakout)
     vol_mult: float
     atr_mult: float
@@ -71,7 +70,6 @@ class MarketConfig:
 XRP_CFG = MarketConfig(
     market="KRW-XRP", asset="XRP", label="XRP v3",
     state_file=STATE_DIR / "xrp_night_state.json",
-    max_buy_krw=333_000,
     vol_mult=1.5, atr_mult=1.5, atr_window=14, vol_baseline=10, lb=10,
     take_profit=2.0, stop_loss=1.5, max_hold_bars=60,
     tp1_pct=1.2, tp1_ratio=0.7,
@@ -81,7 +79,6 @@ XRP_CFG = MarketConfig(
 ETH_CFG = MarketConfig(
     market="KRW-ETH", asset="ETH", label="ETH W1",
     state_file=STATE_DIR / "eth_state.json",
-    max_buy_krw=333_000,
     vol_mult=2.5, atr_mult=2.0, atr_window=14, vol_baseline=20, lb=10,
     take_profit=2.5, stop_loss=1.0, max_hold_bars=24,
     tp1_pct=0.0, tp1_ratio=0.5,
@@ -91,7 +88,6 @@ ETH_CFG = MarketConfig(
 BTC_CFG = MarketConfig(
     market="KRW-BTC", asset="BTC", label="BTC W1",
     state_file=STATE_DIR / "btc_state.json",
-    max_buy_krw=333_000,
     vol_mult=2.5, atr_mult=2.0, atr_window=14, vol_baseline=10, lb=10,
     take_profit=3.0, stop_loss=2.0, max_hold_bars=48,
     tp1_pct=0.0, tp1_ratio=0.5,
@@ -306,7 +302,7 @@ def _msg_buy(cfg: MarketConfig, now: datetime, buy_price: float,
         f"시각: {_ts_short(now)}",
         f"매수가: {_fmt_price(buy_price)}",
         f"수량: {qty:.4f} {cfg.asset}",
-        f"투자금: {krw_used:,}원",
+        f"투자금: {krw_used:,}원 (현재 가용 KRW 한도)",
         f"잔여 KRW: {krw_remaining:,.0f}원",
     ])
 
@@ -376,6 +372,7 @@ def _market_status_block(cfg: MarketConfig, now: datetime, account: dict,
             gap_pct = (indic["bt"] / cur_price - 1) * 100 if cur_price > 0 else 0.0
             price_ok = "🟢" if cur_price > indic["bt"] else "🔴"
             vol_ok = "🟢" if indic["vol_ratio"] >= cfg.vol_mult else "🔴"
+            lines.append(f"매수한도: 현재 가용 KRW {account['krw_available']:,.0f}원")
             lines.append(f"돌파임계: {_fmt_price(indic['bt'])} ({gap_pct:+.2f}%)")
             lines.append(f"시그널: {price_ok}가격  {vol_ok}거래량 "
                          f"({indic['vol_ratio']:.2f}x / {cfg.vol_mult}x)")
@@ -490,7 +487,6 @@ def _combined_status_msg(now: datetime, snapshots: dict, krw_balance: float) -> 
 
 def _startup_msg(now: datetime) -> str:
     parts = [f"🤖 Multi-Market 봇 시작", f"시작: {_ts_full(now)}", ""]
-    total_alloc = 0
     for cfg in MARKETS:
         tp1_str = (f"  TP1: {cfg.tp1_pct}% × {cfg.tp1_ratio*100:.0f}% 부분익절"
                    if cfg.tp1_pct > 0 else "  TP1: 비활성")
@@ -500,11 +496,10 @@ def _startup_msg(now: datetime) -> str:
             f"  시그널: vol×{cfg.vol_mult}, atr×{cfg.atr_mult}, lb={cfg.lb}, vbase={cfg.vol_baseline}",
             f"  청산: TP={cfg.take_profit}%, SL={cfg.stop_loss}%, 보유한도={cfg.max_hold_bars}봉 ({cfg.max_hold_bars*5/60:.0f}h)",
             tp1_str,
-            f"  매수한도: {cfg.max_buy_krw:,}원",
+            "  매수한도: 현재 가용 KRW 잔고 전체",
             "",
         ])
-        total_alloc += cfg.max_buy_krw
-    parts.append(f"총 매수한도: {total_alloc:,}원")
+    parts.append("총 매수한도: 고정 한도 없음 (신호 발생 시점의 현재 가용 KRW)")
     return "\n".join(parts)
 
 
@@ -685,8 +680,8 @@ def trade_one_market(cfg: MarketConfig, now: datetime, account: dict
                       price=cur_price, vol_ratio=indic["vol_ratio"], bt_gap_pct=bt_gap_pct)
         return account, state, cur_price, indic
 
-    # 매수 가능 KRW 결정 (계좌 가용 KRW와 시장 한도 중 작은 값)
-    krw_use = min(account["krw_available"], cfg.max_buy_krw)
+    # 매수 가능 KRW 결정: 고정 시장 한도 없이 현재 가용 KRW 잔고를 사용한다.
+    krw_use = account["krw_available"]
     if krw_use < MIN_ORDER_KRW:
         msg = f"투자가능금액({krw_use:,}원) < 최소주문({MIN_ORDER_KRW:,}원)"
         logger.warning(f"[{cfg.market}] {msg}")
@@ -772,7 +767,7 @@ if __name__ == "__main__":
             f"vbase={cfg.vol_baseline} lb={cfg.lb}  "
             f"hold={cfg.max_hold_bars}  TP={cfg.take_profit}% SL={cfg.stop_loss}%  "
             f"tp1={cfg.tp1_pct}/{cfg.tp1_ratio}  ses={cfg.session}/{cfg.weekday}  "
-            f"max_buy={cfg.max_buy_krw:,}"
+            "max_buy=current_available_krw"
         )
 
     now = datetime.now()
