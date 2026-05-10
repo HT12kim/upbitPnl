@@ -1,125 +1,328 @@
-# 업비트(UPbit) 자동 매매
+# UPbit Multi-Market Auto Trading Bot
 
-- 업비트에서 자동 매매할 수 있도록 Python 코드를 작성하였습니다.
-- 스케줄 및 매매전략은 각자의 입맛에 맞게 수정하여 적용하시면 됩니다.
-- AI(ChatGPT, Cluade 등)에게 미리 작성한 코드([<mark>trading_strategy.py</mark>](/trading/trading_strategy.py))와 생각하고 있던
-  <mark>매매전략</mark>을 던져주시면 입맛에 맞게 코드를 수정해주니 활용하시면 됩니다. 그래도 직접 코드 검증 및 백테스팅은 해봐야 합니다.
-- 보다 쉽게 사용할 수 있는 `pyupbit`라는 라이브러리가 있으나 업비트에서 직접 제공하는 API를 통해 구현하였습니다.
+업비트 원화 마켓에서 `KRW-XRP`, `KRW-ETH`, `KRW-BTC`를 동시에 감시하고, 5분봉 변동성 돌파 전략으로 시장가 매수/매도를 수행하는 Python 자동매매 봇입니다.
 
-## 진행사항
+> 실거래 주문을 실행하는 코드입니다. 반드시 소액 또는 모의 환경에 준하는 검증 후 사용하세요.
 
-- [볼린저밴드 매매전략](/trading/bollinger_band_breakout.py)을 추가해서 안정화 중입니다.
-- 이번 전략으로는 야금야금 수익을 내고 있습니다. 😊
-- 인기 있는 매매전략에 대해서 파악해 보고 하나둘씩 코드를 추가할 예정입니다.
-- 아래 매매전략 내용은 제가 처음에 작성하면서 정리한 내용이니 단순 참고만 하시면 됩니다.
+## 핵심 기능
 
-## 매매전략
+- `main_multi_market.py` 중심의 멀티마켓 라이브 트레이딩
+- 5분봉 1,000개 데이터를 기반으로 ATR 변동성 돌파 및 거래량 필터 계산
+- 시장별 독립 파라미터, 진입 세션, 보유 한도, TP/SL 관리
+- 시장가 매수, 시장가 전량 매도, XRP TP1 부분익절 지원
+- 상태 파일 기반 포지션 복구
+- 텔레그램 시작/종료/체결/실패/오류/시간별 자산현황 알림
+- 시간별 알림에 직전 1시간 투자 판단 결과 요약 포함
+- 백테스트, 최적화, 검증 스크립트 포함
 
-제가 차트를 보면서 임의로 설정한 것이라 매매전략은 크게 특별한 건 아닙니다.
-차트로 다 맞출 수 없습니다. <u>'대개 이렇다'</u>는 것이지 뭐가 됐든 절대적인 건 없다고 생각해야 합니다.  
-매매전략을 직접 해보시면 생각보다 쉽지 않다는 것을 알게 되는데요. 원하는 매매전략을 세워서 실행하시면 됩니다.
+## 주의 사항
 
-### `공통`
+- 이 프로젝트는 투자 수익을 보장하지 않습니다.
+- 업비트 API 키는 출금 권한 없이 발급하는 것을 권장합니다.
+- `.env`, 로그, 상태 파일, 캐시 파일은 Git에 올리지 마세요.
+- 현재 시장가 주문 성공 여부는 업비트 주문 응답의 `uuid` 존재 여부로 판단합니다. 더 엄밀한 운영이 필요하면 주문 UUID로 체결 상태를 재조회하는 로직을 추가하세요.
+- `utils/telegram_utils.py`에 기본 토큰/채팅 ID 값이 들어가 있다면 실제 운영 전 환경 변수 기반으로만 쓰도록 정리하는 것이 안전합니다.
 
-- 동시다발적으로 여러 코인을 매매하는 것이 아니라 특정 코인만을 직접 정하여 매매
-- 원화 마켓(e.g. KRW-DOGE)에서 매매. 마켓은 파라미터를 통해 얼마든지 변경 가능.
-- 매매 시 분할로 하지 않으며, 시장가로 처리
-- 캔들 정보는 5번(건당 200개) 연속 호출하여 가져온 1,000개의 데이터로 매매 전략을 판단
-- `RSI`, `MACD`, `볼린저밴드` 등을 지표로 활용
-- **20MA, 200MA**로 시장 상황 판단 (20MA는 기울기 포함. 20MA가 200MA보다 더 크면 `Bull Market`으로 설정)
+## 실행 대상 파일
 
-### `매수(Buy)`
-
-1. 조건에 맞는지 확인하고 매수를 진행합니다.
-2. 업비트는 원화(KRW) 마켓 거래 수수료가 `0.05%`이기 때문에 주문금액을 현재 원화 잔고(balance)에서 어림잡아 `0.1%` 차감하여 주문합니다.
-
-#### 매수 - 1차 조건
-
-- 불마켓인 경우, 시작(open) 값이 20MA 보다 작고, 종료(close) 값이 20MA를 돌파
-- 불마켓이 아닌 경우, RSI가 30 미만이 된 이후에 MACD 히스토그램이 양전환
-
-#### 매수 - 2차 조건
-
-- 거래량이 20일 이동평균 초과
-- 시작(open) 값이 볼린저밴드 중간 아래이고, 종료(close) 값이 볼린저밴드 상단을 돌파
-
-### `매도(Sell)`
-
-1. 매분마다 매도 타이밍을 체크합니다.
-2. 손절매(0.69% 손실)인 경우 매도합니다.
-3. 불마켓인 경우, 한 번이라도 볼린저밴드 상단을 돌파한 이후에 중심선 아래로 하락 시 매도
-4. 불마켓이 아닌 경우, 이전 캔들이 볼린저밴드 상단을 돌파한 경우 매도
-
-## 스케줄러
-
-- APScheduler의 BackgroundScheduler 적용
-- 매분 선언한 `auto_trading` 함수를 실행하도록 interval 설정
-
-## 업비트 Open API 키
-
-1. PC 페이지 로그인 > 마이 페이지 > Open API 관리 > 정보 입력 후 키 발급
-2. `Access Key`와 `Secret Key` 확인
-3. [.env](/.env) 파일에 정보 입력
-
-## 알림
-
-- 매매 시 SMTP로 메일(Gmail)을 전송합니다.  
-  (Gmail > Forwarding and POP/IMAP > IMAP access > <u>**Enable IMAP**</u>)
-- 현재 사용하고 있는 Google 계정이 아니라 다른 계정(Google)을 하나 더 생성해서 세팅하는 걸 추천합니다.
-- 송/수신자 정보는 [.env](/.env) 파일에 작성하면 됩니다.
-
-## 로그 파일
-
-- 설정 파일: `logging.conf`
-- 경로: logs/
-- 로그 파일: my_log.log
-- 로그 레벨: console - DEBUG / file - INFO
-- suffix: yyyy-MM-dd
-
-로그 폴더가 반드시 있어야 실행됩니다. 로그는 매일 자정을 기준으로 새로 생성되며, 최대 60일 동안 보관합니다.  
-(단, 설정 파일 내용에서 로그 파일의 Path는 <mark>절대경로</mark>로 지정해야 함)
-
-## 개발 환경 및 테스트
-
-- Python Version: 3.13.1 (3.9 버전에서도 정상적으로 동작합니다.)
-- Mac에서 작업하고 이 프로그램 소스를 가지고 윈도우(Python 3.13.1)에서 정상적으로 실행하고 있습니다.
+주된 라이브봇 파일은 다음입니다.
 
 ```shell
-# 프로그램 실행
-# 단, 실행하기 전에 venv 세팅과 관련 라이브러리가 다운로드 된 상태여야 합니다.
-python main.py
+python main_multi_market.py
 ```
 
-## Tree
+보조/레거시 실행 파일도 존재하지만, 현재 멀티마켓 실거래 기준 문서는 `main_multi_market.py`를 기준으로 작성되어 있습니다.
+
+## 전략 개요
+
+봇은 매분 5초에 실행되지만, 실제 투자 판단은 `now.minute % 5 == 0` 조건을 통과할 때만 수행합니다. 즉 실제 매수/매도 판단 주기는 5분입니다.
+
+판단에는 업비트 5분봉 API를 5회 호출하여 최대 1,000개 캔들을 사용합니다. 캔들은 시간 오름차순으로 정렬한 뒤 가장 최근 완성 캔들인 `iloc[-2]`를 기준으로 시그널을 계산합니다.
+
+### 진입 조건
+
+무포지션 상태에서 다음 조건을 모두 만족하면 시장가 매수를 시도합니다.
+
+```text
+현재 종가 > 돌파 임계값
+거래량 비율 >= 시장별 vol_mult
+시장별 세션/요일 필터 통과
+주문 가능 KRW >= 최소주문금액
+```
+
+돌파 임계값은 다음 방식으로 계산합니다.
+
+```text
+rolling_high_prev = 이전 고가 기준 lb 기간 rolling max
+ATR = True Range의 EMA
+breakout_threshold = rolling_high_prev + ATR * atr_mult
+```
+
+거래량 비율은 현재 거래량을 `vol_baseline` 기간 이동평균 거래량으로 나눈 값입니다.
+
+### 청산 조건
+
+포지션 보유 상태에서는 5분마다 아래 순서로 청산 조건을 검사합니다.
+
+1. 손절: 현재가가 매수가 대비 `stop_loss` 이하
+2. 전량 익절: 현재가가 매수가 대비 `take_profit` 이상
+3. TP1 부분익절: TP1 활성 시장에서 1차 익절 조건 충족
+4. 시간청산: 보유 봉 수가 `max_hold_bars` 이상
+
+위 조건 중 하나가 실행되면 해당 시장 처리는 즉시 종료하고 다음 시장으로 넘어갑니다.
+
+## 시장별 기본 파라미터
+
+| Market | Label | 진입 세션 | 요일 | max buy | vol | ATR | vol baseline | lb | TP | SL | Max hold | TP1 |
+|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `KRW-XRP` | XRP v3 | 00-09시 KST | 평일 | 333,000원 | 1.5 | 1.5 | 10 | 10 | 2.0% | 1.5% | 60봉 | 1.2% 도달 시 70% |
+| `KRW-ETH` | ETH W1 | 00-09시 KST | 평일 | 333,000원 | 2.5 | 2.0 | 20 | 10 | 2.5% | 1.0% | 24봉 | 비활성 |
+| `KRW-BTC` | BTC W1 | 24/7 | 전체 | 333,000원 | 2.5 | 2.0 | 10 | 10 | 3.0% | 2.0% | 48봉 | 비활성 |
+
+보유 시간은 5분봉 기준입니다.
+
+```text
+60봉 = 300분 = 5시간
+48봉 = 240분 = 4시간
+24봉 = 120분 = 2시간
+```
+
+## 텔레그램 알림
+
+`utils/telegram_utils.py`의 `send_telegram()`을 통해 텔레그램 메시지를 발송합니다.
+
+알림이 발송되는 시점은 다음과 같습니다.
+
+- 봇 시작
+- 봇 종료
+- 매수 체결
+- 매수 실패 또는 KRW 부족으로 매수 보류
+- 손절 체결 또는 실패
+- 전량 익절 체결 또는 실패
+- TP1 부분익절 체결 또는 실패
+- 시간청산 체결 또는 실패
+- 시장별 처리 중 예외 발생
+- 매시간 통합 자산 현황
+
+시간별 통합 자산 현황에는 다음이 포함됩니다.
+
+- 시장별 현재 포지션 상태
+- 현재가, 매수가, 보유시간, 평가손익
+- SL/TP/TP1 기준가
+- KRW 잔고, 코인 평가액, 총 평가액
+- 직전 1시간 투자 판단 요약
+
+직전 1시간 투자 판단 요약에는 시장별로 다음이 표시됩니다.
+
+- 판단 횟수
+- 세션 내 판단 횟수
+- 거래/시도 횟수
+- 보유 유지 횟수
+- 무신호 횟수
+- 세션 외 횟수
+- 최근 거래/시도 상세
+
+## 상태 파일
+
+포지션 상태는 시장별 JSON 파일에 저장됩니다.
+
+```text
+data_cache/xrp_night_state.json
+data_cache/eth_state.json
+data_cache/btc_state.json
+```
+
+저장되는 주요 값은 다음과 같습니다.
+
+```json
+{
+  "buy_price": 0.0,
+  "tp1_taken": false,
+  "buy_time": null
+}
+```
+
+봇 재시작 후에도 기존 포지션의 매수가, TP1 처리 여부, 매수 시각을 이어서 사용할 수 있습니다. 실제 업비트 잔고와 상태 파일이 어긋나면 무포지션 확인 시 상태 파일을 초기화합니다.
+
+## 설치
+
+Python 3.9 이상 환경을 권장합니다.
 
 ```shell
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## 환경 변수
+
+프로젝트 루트에 `.env` 파일을 만들고 다음 값을 설정합니다.
+
+```shell
+ACCESS_KEY=your_upbit_access_key
+SECRET_KEY=your_upbit_secret_key
+TELEGRAM_TOKEN=your_telegram_bot_token
+TELEGRAM_CHAT_ID=your_telegram_chat_id
+```
+
+업비트 API 키는 업비트 웹에서 발급합니다.
+
+```text
+마이페이지 > Open API 관리 > 키 발급
+```
+
+권장 권한은 다음과 같습니다.
+
+- 자산 조회
+- 주문 조회
+- 주문하기
+- 출금 권한 제외
+- 가능하면 고정 IP 제한 사용
+
+## 실행 전 체크리스트
+
+실행 전 아래 항목을 확인하세요.
+
+- `logs/` 디렉터리가 존재하는지 확인
+- `logging.conf`의 로그 파일 경로가 현재 로컬 경로와 맞는지 확인
+- `.env`에 업비트/텔레그램 키가 설정되어 있는지 확인
+- 주문 금액과 시장별 `max_buy_krw`가 의도한 수준인지 확인
+- 기존 업비트 보유 잔고와 `data_cache/*.json` 상태가 충돌하지 않는지 확인
+- 네트워크 연결과 업비트 API 접근이 정상인지 확인
+
+## 실행
+
+```shell
+source .venv/bin/activate
+python main_multi_market.py
+```
+
+백그라운드 운영 예시는 다음과 같습니다.
+
+```shell
+nohup python main_multi_market.py > logs/bot.out 2>&1 &
+```
+
+종료는 일반적으로 `Ctrl+C` 또는 프로세스 종료를 사용합니다. 정상 종료 경로에서는 텔레그램 종료 알림이 발송됩니다.
+
+## 스케줄
+
+`APScheduler`의 `BackgroundScheduler`를 사용합니다.
+
+```python
+scheduler.add_job(auto_trading, "cron", second=5)
+```
+
+동작 구조는 다음과 같습니다.
+
+- 매분 5초: `auto_trading()` 실행
+- 매 실행: 계좌 조회, 시장별 캔들/지표 스냅샷 수집
+- 5분 단위 분봉 시각: 실제 매수/매도 판단 수행
+- 매시간 hour 변경 시: 통합 자산 현황 및 직전 1시간 판단 요약 전송
+
+## 프로젝트 구조
+
+```text
 .
-├── account
-│   └── my_account.py
-├── logs
-│   └── my_log.log
-├── trading
-│   ├── trade.py
-│   └── trading_strategy.py
-│   └── trading_strategy2.py
-│   └── bollinger_band_breakout.py
-├── upbit_data
-│   └── candle.py
-├── utils
-│   └── email_utils.py
-├── .env
-├── .gitignore
-├── CHANGELOG.md
-├── README.md
-├── logging.conf
-├── main.py
-├── main_bb_breakout.py
-└── requirements.txt
-
-6 directories, 16 files
+├── account/
+│   └── my_account.py              # 업비트 계좌 조회
+├── trading/
+│   ├── trade.py                   # 업비트 시장가 매수/매도
+│   ├── trading_strategy.py         # 레거시 전략
+│   ├── trading_strategy2.py        # 레거시 전략
+│   └── bollinger_band_breakout.py  # 볼린저밴드 전략
+├── upbit_data/
+│   └── candle.py                  # 업비트 분봉 데이터 조회
+├── utils/
+│   ├── telegram_utils.py           # 텔레그램 알림
+│   └── email_utils.py              # 이메일 알림 유틸
+├── main_multi_market.py            # 현재 주력 멀티마켓 라이브봇
+├── main.py                         # 레거시 단일 봇
+├── main_xrp_night.py               # XRP 야간 전략 봇
+├── main_bb_breakout.py             # 볼린저밴드 돌파 봇
+├── backtest_*.py                   # 백테스트 스크립트
+├── optimize_*.py                   # 파라미터 최적화 스크립트
+├── validate_*.py                   # 검증 스크립트
+├── logging.conf                    # 로깅 설정
+├── requirements.txt
+└── README.md
 ```
 
-## 참조
+## 주요 모듈 설명
 
-- [클래스 101 - 버리니 님 파이썬 코인 자동매매](https://class101.page.link/aB74)
-- [업비트 개발자센터 - API Reference](https://docs.upbit.com/reference/)
+### `account/my_account.py`
+
+업비트 `/v1/accounts` API를 호출해 KRW 잔고와 보유 코인 정보를 조회합니다. `ACCESS_KEY`, `SECRET_KEY`는 `.env`에서 읽습니다.
+
+### `upbit_data/candle.py`
+
+업비트 분봉 API를 호출합니다. 1회 최대 200개 제한이 있으므로 5회 호출해 최대 1,000개 캔들을 구성합니다.
+
+### `trading/trade.py`
+
+업비트 `/v1/orders` API로 시장가 주문을 실행합니다.
+
+- 매수: `ord_type=price`
+- 매도: `ord_type=market`
+
+### `utils/telegram_utils.py`
+
+텔레그램 Bot API의 `sendMessage`를 사용해 알림을 보냅니다. 전송 실패 시 예외를 밖으로 던지지 않고 `False`를 반환합니다.
+
+## 로그
+
+로그 설정 파일은 `logging.conf`입니다.
+
+기본 설정은 다음과 같습니다.
+
+- 콘솔 로그 레벨: `DEBUG`
+- 파일 로그 레벨: `INFO`
+- 로그 회전: 매일 자정
+- 보관 기간: 60일
+- 로그 파일: `logs/my_log.log`
+
+`logging.conf` 안의 로그 경로는 절대경로로 되어 있으므로, 다른 환경에서 실행할 경우 반드시 수정해야 합니다.
+
+## 백테스트와 최적화
+
+저장소에는 전략 실험용 스크립트가 포함되어 있습니다.
+
+예시는 다음과 같습니다.
+
+```shell
+python backtest_short_term_5m.py
+python backtest_eth_krw.py
+python optimize_per_market.py
+python validate_per_market.py
+```
+
+실거래 파라미터를 바꾸기 전에는 백테스트와 기간 분리 검증을 먼저 수행하는 것을 권장합니다.
+
+## 운영 개선 포인트
+
+현재 코드 기준으로 우선순위가 높은 개선 포인트는 다음과 같습니다.
+
+- 주문 UUID 기반 체결 상세 재조회
+- 텔레그램 토큰 기본값 제거 및 환경 변수 강제
+- API 요청 타임아웃/재시도 정책 통합
+- 로그 경로를 환경 변수 또는 상대 경로 기반으로 변경
+- 포지션 상태 파일과 실제 업비트 잔고 불일치 감지 강화
+- 전략 파라미터를 코드가 아닌 YAML/JSON 설정 파일로 분리
+- 단위 테스트와 주문 API 목킹 테스트 추가
+
+## 보안 권장사항
+
+- `.env`는 절대 커밋하지 마세요.
+- API 키를 공유하거나 README, 이슈, 로그에 남기지 마세요.
+- 출금 권한은 부여하지 마세요.
+- 텔레그램 봇 토큰이 노출되면 즉시 폐기하고 새로 발급하세요.
+- 서버 운영 시 SSH, 방화벽, IP 제한을 함께 적용하세요.
+
+## 라이선스 및 책임
+
+이 코드는 개인 자동매매 실험과 운영 보조 목적의 예제입니다. 사용자는 코드, 전략, API 키, 주문 결과, 손익에 대한 책임을 직접 부담합니다.
+
+## 참고
+
+- [업비트 개발자센터 API Reference](https://docs.upbit.com/reference/)
+- [APScheduler Documentation](https://apscheduler.readthedocs.io/)
