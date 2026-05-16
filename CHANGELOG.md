@@ -2,6 +2,10 @@
 
 ## 2026-05
 
+- [API 호출 최적화](/main_multi_market.py)
+  - 라이브 매매용 캔들 조회를 시장당 1000봉(5회 호출)에서 최근 200봉(1회 호출)으로 변경
+  - 고정 3종목 + 동적 TOP2 운용 시 분당 캔들 API 호출량을 약 25회에서 5회로 축소
+  - 업비트 public API 429 Too Many Requests 발생 가능성 완화
 - [동적 TOP 상승률 슬롯 확장](/main_multi_market.py)
   - 전일대비 상승률 상위 KRW 종목을 기존 1개에서 2개 슬롯(TOP1/TOP2)으로 확대
   - 슬롯별 상태 파일을 분리해 `top_gainer_state.json`, `top_gainer_2_state.json`에 저장

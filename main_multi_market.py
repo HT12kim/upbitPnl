@@ -38,7 +38,6 @@ for _sub in ("account", "upbit_data", "trading", "utils"):
     sys.path.append(os.path.join(_dir, _sub))
 
 from account.my_account import get_my_exchange_account
-from upbit_data.candle import get_min_candle_data
 from trading.trade import buy_market, sell_market
 from utils.telegram_utils import send_telegram
 
@@ -839,12 +838,72 @@ def _shutdown_msg(now: datetime) -> str:
 
 # ── 시장별 트레이딩 ────────────────────────────────────────────────────────
 
+def _normalize_minute_candles(rows: list[dict]) -> pd.DataFrame:
+    """업비트 분봉 응답을 라이브 전략에서 쓰는 컬럼 형태로 변환한다."""
+    if not rows:
+        raise ValueError("캔들정보가 비어 있습니다.")
+
+    df = pd.DataFrame(rows)
+    required = {
+        "candle_date_time_utc",
+        "candle_date_time_kst",
+        "opening_price",
+        "trade_price",
+        "high_price",
+        "low_price",
+        "candle_acc_trade_volume",
+    }
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"캔들 응답 필수 컬럼 누락: {sorted(missing)}")
+
+    df["date"] = df.candle_date_time_kst.str.split("T").str[0]
+    df["time"] = df.candle_date_time_kst.str.split("T").str[1]
+    df["open"] = df["opening_price"]
+    df["close"] = df["trade_price"]
+    df["high"] = df["high_price"]
+    df["low"] = df["low_price"]
+    df["volume"] = df["candle_acc_trade_volume"]
+    df.drop(
+        ["opening_price", "trade_price", "high_price", "low_price", "candle_acc_trade_volume"],
+        axis=1,
+        inplace=True,
+    )
+    df.sort_values(by="candle_date_time_kst", inplace=True)
+    df.drop_duplicates(subset=["candle_date_time_kst"], keep="last", inplace=True)
+    return df
+
+
+def _fetch_live_min_candles(market: str, minute: int = 5, count: int = 200,
+                            timeout_s: float = 5.0) -> pd.DataFrame:
+    """
+    라이브 매매용 최근 분봉 조회.
+
+    기존 공용 get_min_candle_data는 시장 1개당 API 5회로 1000봉을 가져온다.
+    라이브 전략은 최대 lookback/hold 계산에 200봉이면 충분하므로 1회 호출로 제한해
+    동적 TOP2 운용 시 rate limit 여유를 확보한다.
+    """
+    res = requests.get(
+        f"https://api.upbit.com/v1/candles/minutes/{minute}",
+        params={"market": market, "count": count},
+        headers={"Accept": "application/json"},
+        timeout=timeout_s,
+    )
+    res.raise_for_status()
+    rows = res.json()
+    if isinstance(rows, dict):
+        raise ValueError(f"캔들 API 오류 응답: {rows}")
+    if not isinstance(rows, list):
+        raise ValueError(f"캔들 API 응답 형식 오류: {type(rows).__name__}")
+    return _normalize_minute_candles(rows)
+
+
 def _fetch_candles_with_retry(market: str, attempts: int = 3, sleep_s: float = 1.0) -> pd.DataFrame:
-    """get_min_candle_data를 재시도. 멀티 마켓 호출 시 rate limit 안정성 위함."""
+    """라이브 캔들 조회 재시도. 멀티 마켓 호출 시 rate limit 안정성 위함."""
     last_err: Optional[Exception] = None
     for attempt in range(attempts):
         try:
-            return get_min_candle_data(market, 5)
+            return _fetch_live_min_candles(market, 5)
         except Exception as e:
             last_err = e
             logger.warning(f"[{market}] candle fetch 실패 ({attempt+1}/{attempts}): {e}")
