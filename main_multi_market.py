@@ -127,7 +127,7 @@ TOP_GAINER_CFG_TEMPLATE = {
 }
 
 _last_status_hour: int = -1
-_last_dynamic_selection_hour: int = -1
+_last_dynamic_selection_period: str = ""
 _dynamic_selected_markets: dict[int, str] = {}
 _dynamic_top_gainer_meta: dict[int, dict] = {}
 
@@ -179,6 +179,12 @@ def save_state(cfg: MarketConfig, state: dict) -> None:
 
 def clear_state(cfg: MarketConfig) -> None:
     save_state(cfg, _default_state())
+
+
+def _dynamic_selection_period(now: datetime) -> str:
+    """동적 TOP 선정 주기를 30분 단위로 고정한다."""
+    half_hour_bucket = 0 if now.minute < 30 else 1
+    return now.strftime("%Y%m%d%H") + str(half_hour_bucket)
 
 
 # ── 동적 TOP 상승률 슬롯 ──────────────────────────────────────────────────
@@ -330,8 +336,8 @@ def _dynamic_reason_line(cfg: MarketConfig) -> str:
 
 
 def _select_dynamic_markets(now: datetime, account: dict) -> list[MarketConfig]:
-    """1시간마다 TOP 상승률 2개 종목을 갱신하되, 보유 중인 슬롯은 기존 포지션을 유지한다."""
-    global _last_dynamic_selection_hour, _dynamic_selected_markets, _dynamic_top_gainer_meta
+    """30분마다 TOP 상승률 2개 종목을 갱신하되, 보유 중인 슬롯은 기존 포지션을 유지한다."""
+    global _last_dynamic_selection_period, _dynamic_selected_markets, _dynamic_top_gainer_meta
 
     active: list[MarketConfig] = []
     occupied_markets = set(FIXED_MARKET_CODES)
@@ -363,7 +369,8 @@ def _select_dynamic_markets(now: datetime, account: dict) -> list[MarketConfig]:
     if not refresh_slots:
         return active
 
-    if now.hour == _last_dynamic_selection_hour:
+    selection_period = _dynamic_selection_period(now)
+    if selection_period == _last_dynamic_selection_period:
         for slot in refresh_slots:
             market = _dynamic_selected_markets.get(slot)
             if market and market not in occupied_markets:
@@ -381,7 +388,7 @@ def _select_dynamic_markets(now: datetime, account: dict) -> list[MarketConfig]:
             count=len(refresh_slots),
             excluded_markets=occupied_markets,
         )
-        _last_dynamic_selection_hour = now.hour
+        _last_dynamic_selection_period = selection_period
         for slot, top in zip(refresh_slots, tops):
             _dynamic_selected_markets[slot] = top["market"]
             _dynamic_top_gainer_meta[slot] = {
@@ -398,7 +405,7 @@ def _select_dynamic_markets(now: datetime, account: dict) -> list[MarketConfig]:
         return active
     except Exception as e:
         logger.warning(f"[{TOP_GAINER_LABEL}] 상승률 TOP2 선정 실패: {e}")
-        _last_dynamic_selection_hour = now.hour
+        _last_dynamic_selection_period = selection_period
         for slot in refresh_slots:
             market = _dynamic_selected_markets.get(slot)
             if market and market not in occupied_markets:
@@ -419,7 +426,7 @@ def _select_dynamic_markets(now: datetime, account: dict) -> list[MarketConfig]:
 # ── 인디케이터 ─────────────────────────────────────────────────────────────
 
 def compute_indicators(df: pd.DataFrame, cfg: MarketConfig) -> dict:
-    """1000봉 DataFrame(오름차순)에서 마지막 완성 캔들(iloc[-2]) 기준 시그널."""
+    """분봉 DataFrame(오름차순)에서 마지막 완성 캔들(iloc[-2]) 기준 시그널."""
     close = df["close"].astype(float)
     high = df["high"].astype(float)
     low = df["low"].astype(float)
@@ -444,6 +451,7 @@ def compute_indicators(df: pd.DataFrame, cfg: MarketConfig) -> dict:
         "vol_ratio": float(vol_ratio.iloc[i]),
         "bt": float(breakout_threshold.iloc[i]),
         "atr": float(atr.iloc[i]),
+        "candle_time": str(df["candle_date_time_kst"].iloc[i]),
     }
 
 
@@ -825,7 +833,7 @@ def _startup_msg(now: datetime) -> str:
         "",
         "━ 동적 슬롯 (TOP_GAINER ×2) ━",
         "  대상: KRW 마켓 전일대비 상승률 TOP 2 (고정 3개 시장 제외)",
-        "  갱신: 1시간마다 재선정",
+        "  갱신: 30분마다 재선정",
         "  보유정책: 슬롯별 보유 중 강제 교체 없음 (TP/SL/시간청산까지 유지)",
         "  전략: 거래기회 확대형 5분봉 변동성 돌파 (vol×2.5, atr×1.0, TP=2.0%, SL=1.5%)",
     ])
@@ -922,10 +930,6 @@ def trade_one_market(cfg: MarketConfig, now: datetime, account: dict
     candles = _fetch_candles_with_retry(cfg.market)
     indic = compute_indicators(candles, cfg)
     cur_price = indic["close"]
-
-    do_trade = (now.minute % 5 == 0)
-    if not do_trade:
-        return account, state, cur_price, indic
 
     time_str = now.strftime("%H:%M")
 
@@ -1069,6 +1073,18 @@ def trade_one_market(cfg: MarketConfig, now: datetime, account: dict
                       price=cur_price, vol_ratio=indic["vol_ratio"], bt_gap_pct=bt_gap_pct)
         return account, state, cur_price, indic
 
+    signal_candle = indic.get("candle_time")
+    if signal_candle and state.get("last_entry_signal_candle") == signal_candle:
+        logger.info(f"[{cfg.market}] 동일 5분봉 진입신호 이미 처리됨: {signal_candle}")
+        _record_event(cfg.market, "NO_SIGNAL", time_str,
+                      price=cur_price, vol_ratio=indic["vol_ratio"], bt_gap_pct=0.0)
+        return account, state, cur_price, indic
+
+    # 매매 판단은 매분 수행하지만, 시그널 자체는 완성된 5분봉 기준이다.
+    # 같은 5분봉 신호로 매수 실패/보류 알림이나 재진입이 반복되지 않도록 처리 시각을 저장한다.
+    state["last_entry_signal_candle"] = signal_candle
+    save_state(cfg, state)
+
     # 매수 가능 KRW 결정: 고정 시장 한도 없이 현재 가용 KRW 잔고를 사용한다.
     krw_use = account["krw_available"]
     if krw_use < MIN_ORDER_KRW:
@@ -1095,6 +1111,7 @@ def trade_one_market(cfg: MarketConfig, now: datetime, account: dict
             "buy_price": actual_buy,
             "tp1_taken": False,
             "buy_time": now.isoformat(),
+            "last_entry_signal_candle": signal_candle,
         }
         if _is_dynamic_cfg(cfg):
             # 동적 슬롯은 재시작 후에도 기존 보유 종목을 계속 관리해야 하므로
@@ -1176,7 +1193,7 @@ if __name__ == "__main__":
             "max_buy=current_available_krw"
         )
     logger.info(
-        "  TOP_GAINER x2: KRW ticker/all signed_change_rate TOP2, hourly refresh, "
+        "  TOP_GAINER x2: KRW ticker/all signed_change_rate TOP2, 30m refresh, "
         "no forced rotation while holding"
     )
 

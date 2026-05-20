@@ -205,6 +205,33 @@ nohup python main_multi_market.py > logs/bot.out 2>&1 &
 
 종료는 일반적으로 `Ctrl+C` 또는 프로세스 종료를 사용합니다. 정상 종료 경로에서는 텔레그램 종료 알림이 발송됩니다.
 
+## 로컬 투자 현황 대시보드
+
+`pyupbit` 기반 읽기 전용 대시보드를 함께 제공합니다. 잔고, 자동매매 슬롯, 현재가, 수익률, 주문 이력, 로컬 봇 로그 상태를 한 화면에서 확인할 수 있습니다.
+
+```shell
+python3 -m dashboard.server
+```
+
+기본 접속 주소는 다음입니다.
+
+```text
+http://127.0.0.1:8080
+```
+
+다른 포트를 쓰려면 환경 변수를 지정합니다.
+
+```shell
+DASHBOARD_PORT=8081 python3 -m dashboard.server
+```
+
+주의사항:
+
+- 대시보드는 주문 API를 호출하지 않고 조회 API만 사용합니다.
+- `.env`의 `ACCESS_KEY`, `SECRET_KEY`가 필요합니다.
+- 배포 시에는 API 키가 서버 환경 변수에만 존재하도록 구성하고, 정적 파일에 키를 노출하지 마세요.
+- 현재 프론트엔드는 빠른 로컬 검증을 위해 Tailwind CDN을 사용합니다. 운영 배포에서는 Tailwind CLI/PostCSS 빌드 또는 Next.js 프론트엔드로 분리하는 구성을 권장합니다.
+
 ## 스케줄
 
 `APScheduler`의 `BackgroundScheduler`를 사용합니다.

@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Upbit Auto Trading Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="bg-zinc-950 text-zinc-100">
+    <main class="min-h-screen">
+      <section class="border-b border-zinc-800 bg-zinc-950/90">
+        <div class="mx-auto flex max-w-7xl flex-col gap-4 px-5 py-5 md:flex-row md:items-center md:justify-between">
+          <div>
+            <p class="text-sm font-medium text-emerald-300">PyUpbit Read-only Dashboard</p>
+            <h1 class="mt-1 text-2xl font-semibold tracking-normal text-white md:text-3xl">자동매매 투자 현황</h1>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <button id="refreshBtn" class="inline-flex h-10 items-center gap-2 rounded-md bg-emerald-400 px-4 text-sm font-semibold text-zinc-950 hover:bg-emerald-300">
+              <span>↻</span><span>새로고침</span>
+            </button>
+            <span id="updatedAt" class="text-sm text-zinc-400">-</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="mx-auto grid max-w-[1500px] gap-4 px-5 py-5">
+        <div id="errorBox" class="hidden rounded-md border border-red-500/50 bg-red-950/40 p-4 text-sm text-red-100"></div>
+
+        <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <article class="metric">
+            <span>총 평가자산</span>
+            <strong id="totalAssets">-</strong>
+          </article>
+          <article class="metric">
+            <span>코인 평가액</span>
+            <strong id="coinValue">-</strong>
+          </article>
+          <article class="metric">
+            <span>미실현 손익</span>
+            <strong id="totalPnl">-</strong>
+          </article>
+          <article class="metric">
+            <span>리스크 노출</span>
+            <strong id="riskExposure">-</strong>
+          </article>
+        </div>
+
+        <section class="grid gap-4 xl:grid-cols-[minmax(820px,1fr)_420px]">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>운영 슬롯</h2>
+                <p>고정 3개 + 동적 TOP2 · 5분봉 실시간 갱신</p>
+              </div>
+              <span id="botBadge" class="badge">확인 중</span>
+            </div>
+            <div id="positions" class="grid gap-3 lg:grid-cols-2 2xl:grid-cols-3"></div>
+          </div>
+
+          <aside class="grid content-start gap-4">
+            <div class="panel compact-panel">
+              <div class="panel-head">
+                <div>
+                  <h2>매매 거래내역</h2>
+                  <p>거래시간 포함 최근 체결</p>
+                </div>
+              </div>
+              <div id="tradeCards" class="side-scroll grid gap-2"></div>
+            </div>
+            <div class="panel compact-panel">
+              <div class="panel-head">
+                <div>
+                  <h2>최근 봇 체결 로그</h2>
+                  <p>로컬 로그 파일 파싱</p>
+                </div>
+              </div>
+              <div id="logTrades" class="side-scroll grid gap-2 text-sm"></div>
+            </div>
+          </aside>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>투자 이력</h2>
+              <p>업비트 주문 완료 내역</p>
+            </div>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="min-w-full text-left text-sm">
+              <thead class="text-xs uppercase text-zinc-500">
+                <tr>
+                  <th class="py-3 pr-4">시간</th>
+                  <th class="py-3 pr-4">마켓</th>
+                  <th class="py-3 pr-4">구분</th>
+                  <th class="py-3 pr-4 text-right">평균가</th>
+                  <th class="py-3 pr-4 text-right">수량</th>
+                  <th class="py-3 text-right">체결금액</th>
+                </tr>
+              </thead>
+              <tbody id="orders" class="divide-y divide-zinc-800"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
