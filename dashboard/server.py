@@ -641,6 +641,31 @@ def build_overview(limit: int = 30) -> dict[str, Any]:
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "UpbitDashboard/1.0"
 
+    def _allowed_cors_origin(self) -> str | None:
+        origin = self.headers.get("Origin")
+        allowed_raw = os.getenv("DASHBOARD_ALLOWED_ORIGINS", "*")
+        allowed = {item.strip() for item in allowed_raw.split(",") if item.strip()}
+        if "*" in allowed:
+            return origin or "*"
+        if origin and origin in allowed:
+            return origin
+        return None
+
+    def _send_cors_headers(self) -> None:
+        origin = self._allowed_cors_origin()
+        if not origin:
+            return
+        self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Max-Age", "600")
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self._send_cors_headers()
+        self.end_headers()
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/overview":
@@ -674,6 +699,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        self._send_cors_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

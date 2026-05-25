@@ -20,6 +20,21 @@ let chartTooltip = null;
 let overviewInFlight = false;
 let overviewRequestSeq = 0;
 
+const API_BASE_URL = (() => {
+  const params = new URLSearchParams(window.location.search);
+  const queryApi = params.get("api");
+  if (queryApi) {
+    const normalized = queryApi.replace(/\/+$/, "");
+    localStorage.setItem("UPBIT_API_BASE_URL", normalized);
+    return normalized;
+  }
+  return String(window.UPBIT_API_BASE_URL || localStorage.getItem("UPBIT_API_BASE_URL") || "").replace(/\/+$/, "");
+})();
+
+function apiUrl(path) {
+  return `${API_BASE_URL}${path}`;
+}
+
 function getChartTooltip() {
   if (chartTooltip) return chartTooltip;
   chartTooltip = document.createElement("div");
@@ -363,8 +378,16 @@ async function loadOverview() {
   els.refreshBtn.disabled = true;
   els.refreshBtn.classList.add("opacity-60");
   try {
-    const res = await fetch("/api/overview?limit=30", { cache: "no-store" });
-    const data = await res.json();
+    const res = await fetch(apiUrl("/api/overview?limit=30"), { cache: "no-store" });
+    const contentType = res.headers.get("content-type") || "";
+    const rawBody = await res.text();
+    if (!contentType.includes("application/json")) {
+      const target = apiUrl("/api/overview?limit=30") || "/api/overview?limit=30";
+      throw new Error(
+        `API가 JSON이 아닌 응답을 반환했습니다. API URL을 확인하세요: ${target}`
+      );
+    }
+    const data = JSON.parse(rawBody);
     if (!res.ok) throw new Error(data.error || "대시보드 데이터를 불러오지 못했습니다.");
     if (requestSeq !== overviewRequestSeq) return;
     renderSummary(data.summary);

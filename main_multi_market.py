@@ -187,6 +187,7 @@ BTC_CFG = MarketConfig(
 MARKETS: list[MarketConfig] = [XRP_CFG, ETH_CFG, BTC_CFG]
 FIXED_MARKET_CODES = {cfg.market for cfg in MARKETS}
 MIN_ORDER_KRW = 5_000
+MAX_CONCURRENT_POSITIONS = 3
 UPBIT_TICKER_ALL_URL = "https://api.upbit.com/v1/ticker/all"
 UPBIT_CANDLE_5M_URL = "https://api.upbit.com/v1/candles/minutes/5"
 TOP_GAINER_STATE_FILE = STATE_DIR / "top_gainer_state.json"
@@ -673,6 +674,39 @@ def get_account_info() -> dict:
     return info
 
 
+def _active_position_count(account: dict) -> int:
+    """최소주문 금액 이상으로 보유 중인 코인 포지션 수를 계산한다."""
+    count = 0
+    for asset, row in account.items():
+        if asset in {"KRW", "krw_balance", "krw_available"}:
+            continue
+        if not isinstance(row, dict):
+            continue
+        try:
+            balance = float(row.get("balance", 0))
+            avg_price = float(row.get("avg_buy_price", 0))
+        except (TypeError, ValueError):
+            continue
+        if balance > 0 and avg_price > 0 and balance * avg_price >= MIN_ORDER_KRW:
+            count += 1
+    return count
+
+
+def _buy_budget_krw(account: dict) -> tuple[int, int, int]:
+    """
+    최대 동시 3종목 운용을 위한 1회 매수 금액을 계산한다.
+
+    남은 슬롯 수로 현재 가용 KRW를 나누므로 0개 보유 시 1/3,
+    1개 보유 시 1/2, 2개 보유 시 남은 금액 전체를 사용한다.
+    """
+    active_count = _active_position_count(account)
+    remaining_slots = MAX_CONCURRENT_POSITIONS - active_count
+    if remaining_slots <= 0:
+        return 0, active_count, 0
+    krw_available = int(account.get("krw_available", 0))
+    return math.floor(krw_available / remaining_slots), active_count, remaining_slots
+
+
 def has_position(account: dict, cfg: MarketConfig, price: Optional[float] = None) -> bool:
     """최소 매도 가능 금액 미만의 소량 잔고는 포지션으로 보지 않는다."""
     if cfg.asset not in account:
@@ -853,7 +887,7 @@ def _msg_buy(cfg: MarketConfig, now: datetime, buy_price: float,
         f"시각: {_ts_short(now)}",
         f"매수가: {_fmt_price(buy_price)}",
         f"수량: {qty:.4f} {cfg.asset}",
-        f"투자금: {krw_used:,}원 (현재 가용 KRW 한도)",
+        f"투자금: {krw_used:,}원 (최대 {MAX_CONCURRENT_POSITIONS}종목 슬롯 배분)",
         f"잔여 KRW: {krw_remaining:,.0f}원",
     ]
     reason = _dynamic_reason_line(cfg)
@@ -1043,10 +1077,10 @@ def _startup_msg(now: datetime) -> str:
             f"  시그널: {cfg.entry_kind}, vol×{cfg.vol_mult}, atr×{cfg.atr_mult}, lb={cfg.lb}, vbase={cfg.vol_baseline}",
             f"  청산: TP={cfg.take_profit}%, SL={cfg.stop_loss}%, 보유한도={cfg.max_hold_bars}봉 ({cfg.max_hold_bars*5/60:.0f}h)",
             tp1_str,
-            "  매수한도: 현재 가용 KRW 잔고 전체",
+            f"  매수한도: 최대 {MAX_CONCURRENT_POSITIONS}종목 슬롯 배분",
             "",
         ])
-    parts.append("총 매수한도: 고정 한도 없음 (신호 발생 시점의 현재 가용 KRW)")
+    parts.append(f"총 매수한도: 최대 {MAX_CONCURRENT_POSITIONS}종목 동시 보유 기준 슬롯 배분")
     parts.extend([
         "",
         "━ 동적 슬롯 (TOP_GAINER ×2) ━",
@@ -1320,10 +1354,19 @@ def trade_one_market(cfg: MarketConfig, now: datetime, account: dict
     state["last_entry_signal_candle"] = signal_candle
     save_state(cfg, state)
 
-    # 매수 가능 KRW 결정: 고정 시장 한도 없이 현재 가용 KRW 잔고를 사용한다.
-    krw_use = account["krw_available"]
+    # 매수 가능 KRW 결정: 최대 3개 동시 보유를 위해 남은 슬롯 수로 가용 KRW를 배분한다.
+    krw_use, active_positions, remaining_slots = _buy_budget_krw(account)
+    if remaining_slots <= 0:
+        msg = f"동시 보유 한도 도달({active_positions}/{MAX_CONCURRENT_POSITIONS})"
+        logger.warning(f"[{cfg.market}] {msg}")
+        _record_event(cfg.market, "BUY_BLOCKED", time_str, detail=msg)
+        return account, state, cur_price, indic
+
     if krw_use < MIN_ORDER_KRW:
-        msg = f"투자가능금액({krw_use:,}원) < 최소주문({MIN_ORDER_KRW:,}원)"
+        msg = (
+            f"슬롯 배분 매수금액({krw_use:,}원) < 최소주문({MIN_ORDER_KRW:,}원) "
+            f"(보유 {active_positions}/{MAX_CONCURRENT_POSITIONS})"
+        )
         logger.warning(f"[{cfg.market}] {msg}")
         send_telegram(_msg_fail(cfg, now, "매수", msg))
         _record_event(cfg.market, "BUY_BLOCKED", time_str, detail=msg)
@@ -1366,7 +1409,10 @@ def trade_one_market(cfg: MarketConfig, now: datetime, account: dict
                                 account["krw_balance"]))
         _record_event(cfg.market, "BUY", time_str,
                       price=actual_buy, krw_used=krw_use)
-        logger.info(f"[{cfg.market}] [BUY] {krw_use:,}원 매수 완료  avg_buy_price={actual_buy:.5f}")
+        logger.info(
+            f"[{cfg.market}] [BUY] {krw_use:,}원 매수 완료  avg_buy_price={actual_buy:.5f}  "
+            f"slots_before={active_positions}/{MAX_CONCURRENT_POSITIONS} remaining={remaining_slots}"
+        )
     else:
         logger.error(f"[{cfg.market}] 매수 실패: {reason}")
         send_telegram(_msg_fail(cfg, now, "매수", reason))
@@ -1425,7 +1471,7 @@ if __name__ == "__main__":
             f"vbase={cfg.vol_baseline} lb={cfg.lb}  "
             f"hold={cfg.max_hold_bars}  TP={cfg.take_profit}% SL={cfg.stop_loss}%  "
             f"tp1={cfg.tp1_pct}/{cfg.tp1_ratio}  ses={cfg.session}/{cfg.weekday}  "
-            "max_buy=current_available_krw"
+            f"max_positions={MAX_CONCURRENT_POSITIONS}"
         )
     logger.info(
         "  TOP_GAINER x2: KRW ticker/all signed_change_rate TOP2, 1m refresh, "
