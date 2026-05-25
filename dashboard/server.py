@@ -41,10 +41,10 @@ class DashboardMarket:
 
 MARKETS: tuple[DashboardMarket, ...] = (
     DashboardMarket("KRW-XRP", "XRP", "XRP v3", "xrp_night_state.json", 2.0, 1.5, 60, "평일 00-09시", "fixed"),
-    DashboardMarket("KRW-ETH", "ETH", "ETH F1", "eth_state.json", 2.0, 1.5, 60, "매일 00-09시", "fixed"),
+    DashboardMarket("KRW-ETH", "ETH", "ETH freq-balanced", "eth_state.json", 2.0, 1.5, 60, "평일 00-09시", "fixed"),
     DashboardMarket("KRW-BTC", "BTC", "BTC W1", "btc_state.json", 3.0, 2.0, 48, "매일 09-18시", "fixed"),
-    DashboardMarket("TOP1", "TOP1", "TOP Gainer 1", "top_gainer_state.json", 2.0, 1.5, 60, "24시간", "dynamic"),
-    DashboardMarket("TOP2", "TOP2", "TOP Gainer 2", "top_gainer_2_state.json", 2.0, 1.5, 60, "24시간", "dynamic"),
+    DashboardMarket("TOP1", "TOP1", "TOP Gainer 1", "top_gainer_state.json", 2.5, 1.0, 36, "24시간", "dynamic"),
+    DashboardMarket("TOP2", "TOP2", "TOP Gainer 2", "top_gainer_2_state.json", 2.5, 1.0, 36, "24시간", "dynamic"),
 )
 
 TRADE_RE = re.compile(
@@ -62,6 +62,11 @@ BUY_LOG_DETAIL_RE = re.compile(
 )
 SELL_LOG_DETAIL_RE = re.compile(
     r"(?P<reason>.*?)\s+price=(?P<avg_price>\d+(?:\.\d+)?)\s+buy=(?P<buy_price>\d+(?:\.\d+)?)"
+)
+FAIL_LOG_RE = re.compile(
+    r"(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*"
+    r"\[(?P<market>KRW-[A-Z0-9]+)\]\s+"
+    r"(?P<action>매수|손절|익절|시간청산|TP1)\s+실패:"
 )
 
 
@@ -273,14 +278,13 @@ def _log_time_to_iso(value: str) -> str:
 
 def _log_trade_history(limit: int = 60) -> list[dict[str, Any]]:
     lines = _read_trade_log_lines()
-    failed_keys: set[tuple[str, str]] = set()
+    failed_keys: set[tuple[str, str, str]] = set()
     for line in lines:
-        if "실패" not in line:
-            continue
-        match = re.search(r"(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*\[(?P<market>KRW-[A-Z0-9]+)\]", line)
+        match = FAIL_LOG_RE.search(line)
         if match:
             item = match.groupdict()
-            failed_keys.add((item["time"][:16], item["market"]))
+            side = "bid" if item["action"] == "매수" else "ask"
+            failed_keys.add((item["time"][:16], item["market"], side))
 
     trades: list[dict[str, Any]] = []
     for line in reversed(lines):
@@ -297,18 +301,22 @@ def _log_trade_history(limit: int = 60) -> list[dict[str, Any]]:
         created_at = _log_time_to_iso(item["time"])
 
         if action == "BUY":
+            side = "bid"
+            if (item["time"][:16], market, side) in failed_keys:
+                continue
             detail = BUY_LOG_DETAIL_RE.search(message)
             funds = _float(detail.group("funds").replace(",", "")) if detail else 0.0
             avg_price = _float(detail.group("avg_price")) if detail else 0.0
-            side = "bid"
             pnl_pct = 0.0
             reason = ""
         else:
+            side = "ask"
+            if (item["time"][:16], market, side) in failed_keys:
+                continue
             detail = SELL_LOG_DETAIL_RE.search(message)
             funds = 0.0
             avg_price = _float(detail.group("avg_price")) if detail else 0.0
             buy_price = _float(detail.group("buy_price")) if detail else 0.0
-            side = "ask"
             pnl_pct = (avg_price / buy_price - 1.0) * 100.0 if buy_price > 0 else 0.0
             reason = (detail.group("reason").strip() if detail else message.strip().split("  ")[0].strip())
 

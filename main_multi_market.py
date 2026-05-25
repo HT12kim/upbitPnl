@@ -24,7 +24,7 @@ import json
 import logging
 import logging.config
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -40,10 +40,59 @@ for _sub in ("account", "upbit_data", "trading", "utils"):
 from account.my_account import get_my_exchange_account
 from trading.trade import buy_market, sell_market
 from utils.telegram_utils import send_telegram
+from live_signal import LiveSignalParams, evaluate_live_signal
 
 # ── 시장 설정 ──────────────────────────────────────────────────────────────
 
 STATE_DIR = Path(_dir) / "data_cache"
+STRATEGY_WINNERS_PATH = Path(_dir) / "strategy_winners.json"
+
+
+def _load_strategy_winners() -> dict:
+    """백테스트 winner 설정 파일을 읽는다. 실패 시 하드코딩 baseline으로 동작한다."""
+    if not STRATEGY_WINNERS_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(STRATEGY_WINNERS_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"strategy_winners.json 로드 실패, baseline 사용: {e}")
+        return {}
+    configs = payload.get("market_configs", {})
+    return configs if isinstance(configs, dict) else {}
+
+
+_STRATEGY_WINNERS = _load_strategy_winners()
+
+
+def _winner_value(profile: str, key: str, default):
+    cfg = _STRATEGY_WINNERS.get(profile, {})
+    if not isinstance(cfg, dict):
+        return default
+    return cfg.get(key, default)
+
+
+def _winner_nested_value(profile: str, section: str, key: str, default):
+    cfg = _STRATEGY_WINNERS.get(profile, {})
+    if not isinstance(cfg, dict):
+        return default
+    nested = cfg.get(section, {})
+    if not isinstance(nested, dict):
+        return default
+    return nested.get(key, default)
+
+
+def _optional_signal_kwargs(profile: str) -> dict:
+    """전략별 선택 파라미터를 winner 설정에서 MarketConfig 키로 변환한다."""
+    return {
+        "ema_fast": int(_winner_value(profile, "ema_fast", 5)),
+        "ema_slow": int(_winner_value(profile, "ema_slow", 20)),
+        "slope_lookback": int(_winner_value(profile, "slope_lookback", 1)),
+        "rsi_buy_threshold": int(_winner_value(profile, "rsi_buy_threshold", 30)),
+        "bb_std": float(_winner_value(profile, "bb_std", 2.0)),
+        "vwap_window": int(_winner_value(profile, "vwap_window", 96)),
+        "vwap_pullback_lookback": int(_winner_value(profile, "vwap_pullback_lookback", 5)),
+        "vwap_volume_mult": float(_winner_value(profile, "vwap_volume_mult", 1.0)),
+    }
 
 
 @dataclass(frozen=True)
@@ -52,7 +101,8 @@ class MarketConfig:
     asset: str            # "XRP"
     label: str            # 화면 표시용
     state_file: Path
-    # 시그널 (volatility_breakout)
+    # 진입 시그널
+    entry_kind: str       # volatility_breakout | trend_pullback | mean_reversion | vwap_pullback | combo_or
     vol_mult: float
     atr_mult: float
     atr_window: int
@@ -67,33 +117,71 @@ class MarketConfig:
     # 진입 시간 필터
     session: str          # all | kr_day | kr_night | us_open
     weekday: str          # all | weekday | weekend
+    ema_fast: int = 5
+    ema_slow: int = 20
+    slope_lookback: int = 1
+    rsi_buy_threshold: int = 30
+    bb_std: float = 2.0
+    vwap_window: int = 96
+    vwap_pullback_lookback: int = 5
+    vwap_volume_mult: float = 1.0
 
 
 XRP_CFG = MarketConfig(
-    market="KRW-XRP", asset="XRP", label="XRP v3",
+    market="KRW-XRP", asset="XRP", label=_winner_value("KRW-XRP", "label", "XRP v3"),
     state_file=STATE_DIR / "xrp_night_state.json",
-    vol_mult=1.5, atr_mult=1.5, atr_window=14, vol_baseline=10, lb=10,
-    take_profit=2.0, stop_loss=1.5, max_hold_bars=60,
-    tp1_pct=1.2, tp1_ratio=0.7,
-    session="kr_night", weekday="weekday",
+    entry_kind=_winner_value("KRW-XRP", "entry_kind", "volatility_breakout"),
+    vol_mult=float(_winner_value("KRW-XRP", "breakout_volume_mult", 1.5)),
+    atr_mult=float(_winner_value("KRW-XRP", "atr_breakout_mult", 1.5)),
+    atr_window=int(_winner_value("KRW-XRP", "atr_window", 14)),
+    vol_baseline=int(_winner_value("KRW-XRP", "volume_baseline_window", 10)),
+    lb=int(_winner_value("KRW-XRP", "breakout_lookback", 10)),
+    take_profit=float(_winner_value("KRW-XRP", "take_profit", 2.0)),
+    stop_loss=float(_winner_value("KRW-XRP", "stop_loss", 1.5)),
+    max_hold_bars=int(_winner_value("KRW-XRP", "max_hold_bars", 60)),
+    tp1_pct=float(_winner_value("KRW-XRP", "tp1_pct", 1.2)),
+    tp1_ratio=float(_winner_value("KRW-XRP", "tp1_ratio", 0.7)),
+    session=_winner_value("KRW-XRP", "session", "kr_night"),
+    weekday=_winner_value("KRW-XRP", "weekday", "weekday"),
+    **_optional_signal_kwargs("KRW-XRP"),
 )
 
 ETH_CFG = MarketConfig(
-    market="KRW-ETH", asset="ETH", label="ETH F1",
+    market="KRW-ETH", asset="ETH", label=_winner_value("KRW-ETH", "label", "ETH F1"),
     state_file=STATE_DIR / "eth_state.json",
-    vol_mult=2.5, atr_mult=1.0, atr_window=14, vol_baseline=10, lb=10,
-    take_profit=2.0, stop_loss=1.5, max_hold_bars=60,
-    tp1_pct=0.0, tp1_ratio=0.5,
-    session="kr_night", weekday="all",
+    entry_kind=_winner_value("KRW-ETH", "entry_kind", "volatility_breakout"),
+    vol_mult=float(_winner_value("KRW-ETH", "breakout_volume_mult", 2.5)),
+    atr_mult=float(_winner_value("KRW-ETH", "atr_breakout_mult", 1.0)),
+    atr_window=int(_winner_value("KRW-ETH", "atr_window", 14)),
+    vol_baseline=int(_winner_value("KRW-ETH", "volume_baseline_window", 10)),
+    lb=int(_winner_value("KRW-ETH", "breakout_lookback", 10)),
+    take_profit=float(_winner_value("KRW-ETH", "take_profit", 2.0)),
+    stop_loss=float(_winner_value("KRW-ETH", "stop_loss", 1.5)),
+    max_hold_bars=int(_winner_value("KRW-ETH", "max_hold_bars", 60)),
+    tp1_pct=float(_winner_value("KRW-ETH", "tp1_pct", 0.0)),
+    tp1_ratio=float(_winner_value("KRW-ETH", "tp1_ratio", 0.5)),
+    session=_winner_value("KRW-ETH", "session", "kr_night"),
+    weekday=_winner_value("KRW-ETH", "weekday", "all"),
+    **_optional_signal_kwargs("KRW-ETH"),
 )
 
 BTC_CFG = MarketConfig(
-    market="KRW-BTC", asset="BTC", label="BTC W1",
+    market="KRW-BTC", asset="BTC", label=_winner_value("KRW-BTC", "label", "BTC W1"),
     state_file=STATE_DIR / "btc_state.json",
-    vol_mult=2.5, atr_mult=2.0, atr_window=14, vol_baseline=10, lb=10,
-    take_profit=3.0, stop_loss=2.0, max_hold_bars=48,
-    tp1_pct=0.0, tp1_ratio=0.5,
-    session="kr_day", weekday="all",
+    entry_kind=_winner_value("KRW-BTC", "entry_kind", "volatility_breakout"),
+    vol_mult=float(_winner_value("KRW-BTC", "breakout_volume_mult", 2.5)),
+    atr_mult=float(_winner_value("KRW-BTC", "atr_breakout_mult", 2.0)),
+    atr_window=int(_winner_value("KRW-BTC", "atr_window", 14)),
+    vol_baseline=int(_winner_value("KRW-BTC", "volume_baseline_window", 10)),
+    lb=int(_winner_value("KRW-BTC", "breakout_lookback", 10)),
+    take_profit=float(_winner_value("KRW-BTC", "take_profit", 3.0)),
+    stop_loss=float(_winner_value("KRW-BTC", "stop_loss", 2.0)),
+    max_hold_bars=int(_winner_value("KRW-BTC", "max_hold_bars", 48)),
+    tp1_pct=float(_winner_value("KRW-BTC", "tp1_pct", 0.0)),
+    tp1_ratio=float(_winner_value("KRW-BTC", "tp1_ratio", 0.5)),
+    session=_winner_value("KRW-BTC", "session", "kr_day"),
+    weekday=_winner_value("KRW-BTC", "weekday", "all"),
+    **_optional_signal_kwargs("KRW-BTC"),
 )
 
 MARKETS: list[MarketConfig] = [XRP_CFG, ETH_CFG, BTC_CFG]
@@ -103,6 +191,7 @@ UPBIT_TICKER_ALL_URL = "https://api.upbit.com/v1/ticker/all"
 UPBIT_CANDLE_5M_URL = "https://api.upbit.com/v1/candles/minutes/5"
 TOP_GAINER_STATE_FILE = STATE_DIR / "top_gainer_state.json"
 TOP_GAINER_2_STATE_FILE = STATE_DIR / "top_gainer_2_state.json"
+TOP_GAINER_COOLDOWN_FILE = STATE_DIR / "top_gainer_cooldowns.json"
 TOP_GAINER_STATE_FILES = {
     1: TOP_GAINER_STATE_FILE,
     2: TOP_GAINER_2_STATE_FILE,
@@ -110,20 +199,32 @@ TOP_GAINER_STATE_FILES = {
 TOP_GAINER_LABEL = "TOP_GAINER"
 TOP_GAINER_SLOT_COUNT = 2
 TOP_GAINER_MIN_CANDLES = 200
-TOP_GAINER_CANDIDATE_CHECK_LIMIT = 20
+TOP_GAINER_CANDIDATE_CHECK_LIMIT = 40
+TOP_GAINER_MIN_ACC_TRADE_PRICE_24H = int(_winner_nested_value(
+    "TOP_GAINER", "selection_filters", "min_acc_trade_price_24h", 1_000_000_000,
+))
+TOP_GAINER_MAX_SPREAD_PCT = float(_winner_nested_value(
+    "TOP_GAINER", "selection_filters", "max_orderbook_spread_pct", 0.35,
+))
+TOP_GAINER_STOP_LOSS_COOLDOWN_MINUTES = int(_winner_nested_value(
+    "TOP_GAINER", "selection_filters", "stop_loss_cooldown_minutes", 30,
+))
+UPBIT_ORDERBOOK_URL = "https://api.upbit.com/v1/orderbook"
 TOP_GAINER_CFG_TEMPLATE = {
-    "vol_mult": 2.5,
-    "atr_mult": 1.0,
-    "atr_window": 14,
-    "vol_baseline": 10,
-    "lb": 10,
-    "take_profit": 2.0,
-    "stop_loss": 1.5,
-    "max_hold_bars": 60,
-    "tp1_pct": 0.0,
-    "tp1_ratio": 0.5,
-    "session": "all",
-    "weekday": "all",
+    "entry_kind": _winner_value("TOP_GAINER", "entry_kind", "volatility_breakout"),
+    "vol_mult": float(_winner_value("TOP_GAINER", "breakout_volume_mult", 2.5)),
+    "atr_mult": float(_winner_value("TOP_GAINER", "atr_breakout_mult", 1.0)),
+    "atr_window": int(_winner_value("TOP_GAINER", "atr_window", 14)),
+    "vol_baseline": int(_winner_value("TOP_GAINER", "volume_baseline_window", 10)),
+    "lb": int(_winner_value("TOP_GAINER", "breakout_lookback", 10)),
+    "take_profit": float(_winner_value("TOP_GAINER", "take_profit", 2.0)),
+    "stop_loss": float(_winner_value("TOP_GAINER", "stop_loss", 1.5)),
+    "max_hold_bars": int(_winner_value("TOP_GAINER", "max_hold_bars", 60)),
+    "tp1_pct": float(_winner_value("TOP_GAINER", "tp1_pct", 0.0)),
+    "tp1_ratio": float(_winner_value("TOP_GAINER", "tp1_ratio", 0.5)),
+    "session": _winner_value("TOP_GAINER", "session", "all"),
+    "weekday": _winner_value("TOP_GAINER", "weekday", "all"),
+    **_optional_signal_kwargs("TOP_GAINER"),
 }
 
 _last_status_hour: int = -1
@@ -181,10 +282,54 @@ def clear_state(cfg: MarketConfig) -> None:
     save_state(cfg, _default_state())
 
 
+def _load_top_gainer_cooldowns() -> dict[str, str]:
+    try:
+        raw = json.loads(TOP_GAINER_COOLDOWN_FILE.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_top_gainer_cooldowns(cooldowns: dict[str, str]) -> None:
+    TOP_GAINER_COOLDOWN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TOP_GAINER_COOLDOWN_FILE.write_text(
+        json.dumps(cooldowns, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _cooldown_until(market: str, now: datetime) -> Optional[datetime]:
+    value = _load_top_gainer_cooldowns().get(market)
+    if not value:
+        return None
+    try:
+        until = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return until if until > now else None
+
+
+def _set_top_gainer_cooldown(market: str, now: datetime) -> datetime:
+    """동적 슬롯 손절 후 같은 마켓 재진입을 일시 차단한다."""
+    cooldowns = _load_top_gainer_cooldowns()
+    until = now + timedelta(minutes=TOP_GAINER_STOP_LOSS_COOLDOWN_MINUTES)
+    cooldowns[market] = until.isoformat()
+
+    # 만료된 항목은 저장 시 정리해 쿨다운 파일이 계속 커지지 않게 한다.
+    cleaned: dict[str, str] = {}
+    for key, value in cooldowns.items():
+        try:
+            if datetime.fromisoformat(value) > now:
+                cleaned[key] = value
+        except ValueError:
+            continue
+    _save_top_gainer_cooldowns(cleaned)
+    return until
+
+
 def _dynamic_selection_period(now: datetime) -> str:
-    """동적 TOP 선정 주기를 30분 단위로 고정한다."""
-    half_hour_bucket = 0 if now.minute < 30 else 1
-    return now.strftime("%Y%m%d%H") + str(half_hour_bucket)
+    """동적 TOP 선정 주기를 1분 단위로 고정한다."""
+    return now.strftime("%Y%m%d%H%M")
 
 
 # ── 동적 TOP 상승률 슬롯 ──────────────────────────────────────────────────
@@ -237,6 +382,33 @@ def _has_min_5m_candles(market: str, min_count: int = TOP_GAINER_MIN_CANDLES,
         return False
 
 
+def _orderbook_spread_pct(market: str, timeout_s: float = 3.0) -> Optional[float]:
+    """최우선 호가 기준 스프레드 비율을 계산한다."""
+    try:
+        res = requests.get(
+            UPBIT_ORDERBOOK_URL,
+            params={"markets": market},
+            headers={"Accept": "application/json"},
+            timeout=timeout_s,
+        )
+        res.raise_for_status()
+        rows = res.json()
+        if not isinstance(rows, list) or not rows:
+            return None
+        units = rows[0].get("orderbook_units", [])
+        if not units:
+            return None
+        ask = float(units[0].get("ask_price", 0))
+        bid = float(units[0].get("bid_price", 0))
+        if ask <= 0 or bid <= 0:
+            return None
+        mid = (ask + bid) / 2.0
+        return (ask - bid) / mid * 100.0 if mid > 0 else None
+    except Exception as e:
+        logger.warning(f"[{TOP_GAINER_LABEL}] {market} 호가 스프레드 확인 실패: {e}")
+        return None
+
+
 def get_top_krw_gainers(count: int = TOP_GAINER_SLOT_COUNT,
                         timeout_s: float = 5.0,
                         excluded_markets: Optional[set[str]] = None,
@@ -268,6 +440,7 @@ def get_top_krw_gainers(count: int = TOP_GAINER_SLOT_COUNT,
         market = str(row.get("market", ""))
         signed_change_rate = row.get("signed_change_rate")
         trade_price = row.get("trade_price")
+        acc_trade_price_24h = row.get("acc_trade_price_24h")
         if not market.startswith("KRW-"):
             continue
         if market in excluded:
@@ -276,16 +449,28 @@ def get_top_krw_gainers(count: int = TOP_GAINER_SLOT_COUNT,
             continue
         if bool(row.get("is_trading_suspended", False)):
             continue
-        if signed_change_rate is None or trade_price is None:
+        if signed_change_rate is None or trade_price is None or acc_trade_price_24h is None:
             continue
         try:
             rate = float(signed_change_rate)
             price = float(trade_price)
+            trade_amount_24h = float(acc_trade_price_24h)
         except (TypeError, ValueError):
             continue
         if price <= 0:
             continue
-        candidates.append({"market": market, "signed_change_rate": rate, "trade_price": price})
+        if trade_amount_24h < TOP_GAINER_MIN_ACC_TRADE_PRICE_24H:
+            logger.info(
+                f"[{TOP_GAINER_LABEL}] {market} 제외: "
+                f"24h 거래대금 {trade_amount_24h:,.0f}원 < {TOP_GAINER_MIN_ACC_TRADE_PRICE_24H:,}원"
+            )
+            continue
+        candidates.append({
+            "market": market,
+            "signed_change_rate": rate,
+            "trade_price": price,
+            "acc_trade_price_24h": trade_amount_24h,
+        })
 
     if not candidates:
         raise ValueError("선정 가능한 KRW 상승률 후보가 없습니다.")
@@ -297,6 +482,24 @@ def get_top_krw_gainers(count: int = TOP_GAINER_SLOT_COUNT,
         # 상승률 상위권 신규 상장 코인은 캔들 수가 부족해 전략 계산이 불가능할 수 있다.
         if item["market"] in selected_markets:
             continue
+        cooldown_until = _cooldown_until(item["market"], datetime.now())
+        if cooldown_until is not None:
+            logger.info(
+                f"[{TOP_GAINER_LABEL}] {item['market']} 제외: "
+                f"손절 쿨다운 {cooldown_until.strftime('%H:%M:%S')}까지"
+            )
+            continue
+        spread_pct = _orderbook_spread_pct(item["market"], timeout_s=timeout_s)
+        if spread_pct is None:
+            logger.info(f"[{TOP_GAINER_LABEL}] {item['market']} 제외: 호가 스프레드 확인 불가")
+            continue
+        if spread_pct > TOP_GAINER_MAX_SPREAD_PCT:
+            logger.info(
+                f"[{TOP_GAINER_LABEL}] {item['market']} 제외: "
+                f"스프레드 {spread_pct:.3f}% > {TOP_GAINER_MAX_SPREAD_PCT:.3f}%"
+            )
+            continue
+        item["spread_pct"] = spread_pct
         if _has_min_5m_candles(item["market"], min_count=min_candles, timeout_s=timeout_s):
             selected.append(item)
             selected_markets.add(item["market"])
@@ -336,7 +539,7 @@ def _dynamic_reason_line(cfg: MarketConfig) -> str:
 
 
 def _select_dynamic_markets(now: datetime, account: dict) -> list[MarketConfig]:
-    """30분마다 TOP 상승률 2개 종목을 갱신하되, 보유 중인 슬롯은 기존 포지션을 유지한다."""
+    """매분 TOP 상승률 2개 종목을 갱신하되, 보유 중인 슬롯은 기존 포지션을 유지한다."""
     global _last_dynamic_selection_period, _dynamic_selected_markets, _dynamic_top_gainer_meta
 
     active: list[MarketConfig] = []
@@ -399,7 +602,8 @@ def _select_dynamic_markets(now: datetime, account: dict) -> list[MarketConfig]:
             occupied_markets.add(top["market"])
             logger.info(
                 f"[{TOP_GAINER_LABEL}{slot}] selected {top['market']} "
-                f"rate={top['signed_change_rate'] * 100:+.2f}% price={top['trade_price']:.8f}"
+                f"rate={top['signed_change_rate'] * 100:+.2f}% price={top['trade_price']:.8f} "
+                f"amount24h={top.get('acc_trade_price_24h', 0):.0f} spread={top.get('spread_pct', 0):.3f}%"
             )
             active.append(_build_top_gainer_cfg(top["market"], top["signed_change_rate"], slot=slot))
         return active
@@ -425,34 +629,29 @@ def _select_dynamic_markets(now: datetime, account: dict) -> list[MarketConfig]:
 
 # ── 인디케이터 ─────────────────────────────────────────────────────────────
 
+def _signal_params_from_cfg(cfg: MarketConfig) -> LiveSignalParams:
+    """MarketConfig를 라이브 시그널 계산 파라미터로 변환한다."""
+    return LiveSignalParams(
+        entry_kind=cfg.entry_kind,
+        ema_fast=cfg.ema_fast,
+        ema_slow=cfg.ema_slow,
+        slope_lookback=cfg.slope_lookback,
+        rsi_buy_threshold=cfg.rsi_buy_threshold,
+        bb_std=cfg.bb_std,
+        breakout_volume_mult=cfg.vol_mult,
+        atr_breakout_mult=cfg.atr_mult,
+        atr_window=cfg.atr_window,
+        volume_baseline_window=cfg.vol_baseline,
+        breakout_lookback=cfg.lb,
+        vwap_window=cfg.vwap_window,
+        vwap_pullback_lookback=cfg.vwap_pullback_lookback,
+        vwap_volume_mult=cfg.vwap_volume_mult,
+    )
+
+
 def compute_indicators(df: pd.DataFrame, cfg: MarketConfig) -> dict:
     """분봉 DataFrame(오름차순)에서 마지막 완성 캔들(iloc[-2]) 기준 시그널."""
-    close = df["close"].astype(float)
-    high = df["high"].astype(float)
-    low = df["low"].astype(float)
-    volume = df["volume"].astype(float)
-
-    tr = pd.concat([
-        high - low,
-        (high - close.shift(1)).abs(),
-        (low - close.shift(1)).abs(),
-    ], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1.0 / cfg.atr_window, adjust=False, min_periods=cfg.atr_window).mean()
-
-    vol_ma = volume.rolling(cfg.vol_baseline, min_periods=1).mean()
-    vol_ratio = (volume / vol_ma).replace([float("inf"), float("-inf")], 0).fillna(0)
-
-    rolling_high_prev = high.shift(1).rolling(cfg.lb, min_periods=1).max()
-    breakout_threshold = rolling_high_prev + atr * cfg.atr_mult
-
-    i = -2
-    return {
-        "close": float(close.iloc[i]),
-        "vol_ratio": float(vol_ratio.iloc[i]),
-        "bt": float(breakout_threshold.iloc[i]),
-        "atr": float(atr.iloc[i]),
-        "candle_time": str(df["candle_date_time_kst"].iloc[i]),
-    }
+    return evaluate_live_signal(df, _signal_params_from_cfg(cfg))
 
 
 # ── 계좌 ───────────────────────────────────────────────────────────────────
@@ -491,6 +690,33 @@ def _position_value_krw(account: dict, cfg: MarketConfig, price: float) -> float
     if cfg.asset not in account:
         return 0.0
     return float(account[cfg.asset]["balance"]) * price
+
+
+def _mark_dust_position(cfg: MarketConfig, state: dict, price: float, now: datetime) -> dict:
+    """최소주문 미만 잔여 포지션은 반복 매도 실패를 막기 위해 별도 상태로 남긴다."""
+    dust_state = {
+        **_default_state(),
+        "dust_position": True,
+        "dust_market": cfg.market,
+        "dust_asset": cfg.asset,
+        "dust_price": price,
+        "dust_marked_at": now.isoformat(),
+        "last_entry_signal_candle": state.get("last_entry_signal_candle"),
+    }
+    if _is_dynamic_cfg(cfg):
+        slot = _dynamic_slot(cfg) or 1
+        meta = _dynamic_top_gainer_meta.get(slot, {})
+        dust_state.update({
+            "market": cfg.market,
+            "asset": cfg.asset,
+            "slot": slot,
+            "signed_change_rate": state.get("signed_change_rate", meta.get("signed_change_rate")),
+            "selected_trade_price": state.get("selected_trade_price", meta.get("trade_price")),
+            "selected_at": state.get("selected_at", meta.get("selected_at")),
+        })
+    save_state(cfg, dust_state)
+    logger.info(f"[{cfg.market}] 최소주문 미만 잔여 포지션 dust 처리 price={price:.5f}")
+    return dust_state
 
 
 # ── 필터 / 유틸 ────────────────────────────────────────────────────────────
@@ -583,6 +809,41 @@ def _fmt_session(cfg: MarketConfig) -> str:
     return f"{sess} / {week}"
 
 
+def _fmt_entry_signal(cfg: MarketConfig, indic: dict) -> str:
+    """현재 진입 전략에 맞는 핵심 시그널 상태를 짧게 표시한다."""
+    kind = indic.get("entry_kind", cfg.entry_kind)
+    if kind == "volatility_breakout":
+        price_ok = "Y" if indic["close"] > indic["bt"] else "N"
+        vol_ok = "Y" if indic["vol_ratio"] >= cfg.vol_mult else "N"
+        return (
+            f"vol_breakout price={price_ok} vol={vol_ok} "
+            f"({indic['vol_ratio']:.2f}x/{cfg.vol_mult}x)"
+        )
+    if kind == "trend_pullback":
+        return (
+            f"trend_pullback signal={'Y' if indic['trend_signal'] else 'N'} "
+            f"EMA{cfg.ema_fast}/{cfg.ema_slow}"
+        )
+    if kind == "mean_reversion":
+        return (
+            f"mean_reversion signal={'Y' if indic['mean_reversion_signal'] else 'N'} "
+            f"RSI={indic['rsi']:.1f}/{cfg.rsi_buy_threshold}"
+        )
+    if kind == "vwap_pullback":
+        return (
+            f"vwap_pullback signal={'Y' if indic['vwap_signal'] else 'N'} "
+            f"vol={indic['vol_ratio']:.2f}x/{cfg.vwap_volume_mult}x"
+        )
+    if kind == "combo_or":
+        return (
+            "combo_or "
+            f"trend={'Y' if indic['trend_signal'] else 'N'} "
+            f"mean={'Y' if indic['mean_reversion_signal'] else 'N'} "
+            f"vol={'Y' if indic['volatility_signal'] else 'N'}"
+        )
+    return f"{kind} signal={'Y' if indic.get('entry_signal') else 'N'}"
+
+
 # ── 텔레그램 메시지: 매매 알림 ─────────────────────────────────────────────
 
 def _msg_buy(cfg: MarketConfig, now: datetime, buy_price: float,
@@ -638,177 +899,134 @@ def _msg_error(cfg: MarketConfig, now: datetime, e: Exception) -> str:
 
 # ── 텔레그램 메시지: 시간별 통합 현황 ──────────────────────────────────────
 
-def _market_status_block(cfg: MarketConfig, now: datetime, account: dict,
-                          state: dict, cur_price: float, indic: dict) -> str:
-    lines = [f"━ {cfg.market} ({cfg.label}) ━"]
-    if _is_dynamic_cfg(cfg):
-        slot = _dynamic_slot(cfg) or 1
-        meta = _dynamic_top_gainer_meta.get(slot, {})
-        selected_at = meta.get("selected_at")
-        rate = meta.get("signed_change_rate")
-        selected_text = "선정시각: -"
-        if selected_at:
-            try:
-                selected_text = f"선정시각: {_ts_short(datetime.fromisoformat(selected_at))}"
-            except Exception:
-                selected_text = f"선정시각: {selected_at}"
-        if rate is not None:
-            lines.append(f"동적슬롯 TOP{slot}: 전일대비 {rate * 100:+.2f}% (고정 제외) / {selected_text}")
-        else:
-            lines.append(f"동적슬롯 TOP{slot}: 전일대비 상승률 상위권(고정 3개 시장 제외) / {selected_text}")
-        if meta.get("status") == "fallback":
-            lines.append(f"선정상태: API 실패로 직전 선정 유지 ({meta.get('last_error', '')[:40]})")
-    if has_position(account, cfg, cur_price):
-        bal = float(account[cfg.asset]["balance"])
-        avg = account[cfg.asset]["avg_buy_price"]
-        buy_price = state.get("buy_price") or avg
-        tp1_taken = bool(state.get("tp1_taken", False))
-        hold_bars = hold_bars_elapsed(state.get("buy_time"), now)
-        pnl_pct = (cur_price / buy_price - 1) * 100 if buy_price > 0 else 0.0
-        pnl_krw = (cur_price - buy_price) * bal if buy_price > 0 else 0.0
-        sl_p = buy_price * (1.0 - cfg.stop_loss / 100.0)
-        tp_p = buy_price * (1.0 + cfg.take_profit / 100.0)
-        lines.append(f"🔵 LONG  P&L: {_fmt_pnl(pnl_pct, pnl_krw)}")
-        lines.append(f"가격: {_fmt_price(cur_price)}  매수: {_fmt_price(buy_price)}")
-        lines.append(f"보유: {_fmt_hold(hold_bars)} / 한도 {cfg.max_hold_bars}봉")
-        lines.append(f"SL: {_fmt_price(sl_p)}  TP: {_fmt_price(tp_p)}")
-        if cfg.tp1_pct > 0:
-            tp1_p = buy_price * (1.0 + cfg.tp1_pct / 100.0)
-            tp1_status = "✓ 완료" if tp1_taken else "대기"
-            lines.append(f"TP1: {_fmt_price(tp1_p)}  ({tp1_status})")
-        lines.append(f"수량: {bal:.4f} {cfg.asset}  평가: {bal*cur_price:,.0f}원")
-    else:
-        in_session = passes_filter(now, cfg)
-        ses_label = "✅ 진입가능" if in_session else f"⏸ 세션외 ({_fmt_session(cfg)})"
-        lines.append(f"⚪ NONE  {ses_label}")
-        lines.append(f"가격: {_fmt_price(cur_price)}")
-        if in_session:
-            gap_pct = (indic["bt"] / cur_price - 1) * 100 if cur_price > 0 else 0.0
-            price_ok = "🟢" if cur_price > indic["bt"] else "🔴"
-            vol_ok = "🟢" if indic["vol_ratio"] >= cfg.vol_mult else "🔴"
-            lines.append(f"매수한도: 현재 가용 KRW {account['krw_available']:,.0f}원")
-            lines.append(f"돌파임계: {_fmt_price(indic['bt'])} ({gap_pct:+.2f}%)")
-            lines.append(f"시그널: {price_ok}가격  {vol_ok}거래량 "
-                         f"({indic['vol_ratio']:.2f}x / {cfg.vol_mult}x)")
-    return "\n".join(lines)
+def _position_summary_line(cfg: MarketConfig, account: dict, state: dict,
+                           cur_price: float, now: datetime) -> tuple[float, str]:
+    if not has_position(account, cfg, cur_price):
+        return 0.0, ""
 
-
-def _hourly_activity_block(cfg: MarketConfig) -> str:
-    """1시간 동안 시장의 판단/거래 결과 요약."""
-    events = _hourly_events.get(cfg.market, [])
-    if not events:
-        return f"━ {cfg.market} ━\n투자 판단 기록 없음"
-
-    total = len(events)
-    in_session = sum(1 for e in events if e["kind"] != "OUT_OF_SESSION")
-    hold_count = sum(1 for e in events if e["kind"] == "HOLD")
-    no_sig_count = sum(1 for e in events if e["kind"] == "NO_SIGNAL")
-    oos_count = sum(1 for e in events if e["kind"] == "OUT_OF_SESSION")
-
-    sell_kinds = {"SELL_SL", "SELL_TP", "SELL_TP1", "SELL_TIME", "SELL_FAIL"}
-    trade_kinds = sell_kinds | {"BUY", "BUY_FAIL", "BUY_BLOCKED"}
-    trades = [e for e in events if e["kind"] in trade_kinds]
-
-    lines = [f"━ {cfg.market} ━ 판단 {total}회 (세션내 {in_session}회)"]
-    lines.append(
-        f"요약: 거래/시도 {len(trades)}회, 보유유지 {hold_count}회, "
-        f"무신호 {no_sig_count}회, 세션외 {oos_count}회"
+    balance = float(account[cfg.asset]["balance"])
+    buy_price = state.get("buy_price") or account[cfg.asset]["avg_buy_price"]
+    value = balance * cur_price
+    pnl_pct = (cur_price / buy_price - 1.0) * 100.0 if buy_price > 0 else 0.0
+    hold_bars = hold_bars_elapsed(state.get("buy_time"), now)
+    return value, (
+        f"- {cfg.market}: {_fmt_price(value)} "
+        f"PnL {pnl_pct:+.2f}% / 보유 {_fmt_hold(hold_bars)}"
     )
 
-    if trades:
-        # 거래 이벤트가 많아져도 텔레그램 메시지가 과도하게 길어지지 않도록 최근 항목만 상세 표시한다.
-        recent_trades = trades[-8:]
-        if len(trades) > len(recent_trades):
-            lines.append(f"최근 거래/시도 {len(recent_trades)}건만 표시")
-        for t in recent_trades:
-            tm = t["time"]
-            kind = t["kind"]
-            if kind == "BUY":
-                lines.append(f"🟢 {tm} 매수 @ {_fmt_price(t['price'])}")
-            elif kind == "BUY_FAIL":
-                lines.append(f"⚠️ {tm} 매수실패 ({t.get('detail','')[:40]})")
-            elif kind == "BUY_BLOCKED":
-                lines.append(f"⚠️ {tm} 매수보류 (KRW 부족)")
-            elif kind == "SELL_SL":
-                lines.append(f"❌ {tm} 손절 @ {_fmt_price(t['price'])} "
-                             f"({_fmt_pnl(t['pnl_pct'], t['pnl_krw'])})")
-            elif kind == "SELL_TP":
-                lines.append(f"✅ {tm} 익절 @ {_fmt_price(t['price'])} "
-                             f"({_fmt_pnl(t['pnl_pct'], t['pnl_krw'])})")
-            elif kind == "SELL_TP1":
-                lines.append(f"🎯 {tm} TP1 @ {_fmt_price(t['price'])} "
-                             f"({_fmt_pnl(t['pnl_pct'], t['pnl_krw'])})")
-            elif kind == "SELL_TIME":
-                lines.append(f"⏰ {tm} 시간청산 @ {_fmt_price(t['price'])} "
-                             f"({_fmt_pnl(t['pnl_pct'], t['pnl_krw'])})")
-            elif kind == "SELL_FAIL":
-                lines.append(f"⚠️ {tm} 매도실패 ({t.get('detail','')[:40]})")
-    else:
-        if hold_count == total:
-            last = events[-1]
-            lines.append(f"보유 유지 {hold_count}회  현재 PnL: {last.get('pnl_pct', 0):+.2f}%")
-        elif oos_count == total:
-            lines.append("세션 외 — 거래 없음")
-        elif no_sig_count > 0:
-            # 가장 가까웠던 진입 근접도
-            no_sigs = [e for e in events if e["kind"] == "NO_SIGNAL"]
-            best = min(no_sigs, key=lambda e: abs(e.get("bt_gap_pct", 999)))
-            best_vr = max((e.get("vol_ratio", 0) for e in no_sigs), default=0)
-            lines.append(f"진입신호 0회 / 무포지션 대기 {no_sig_count}회")
-            lines.append(f"가장 근접: 돌파임계 대비 {best.get('bt_gap_pct', 0):+.2f}%, "
-                         f"최고 거래량비 {best_vr:.2f}x (기준 {cfg.vol_mult}x)")
-        else:
-            mix = []
-            if hold_count: mix.append(f"보유 {hold_count}")
-            if no_sig_count: mix.append(f"무신호 {no_sig_count}")
-            if oos_count: mix.append(f"세션외 {oos_count}")
-            lines.append(" / ".join(mix) if mix else "활동 없음")
 
-    return "\n".join(lines)
+def _fmt_hourly_event(cfg: MarketConfig, event: dict) -> str:
+    tm = event.get("time", "--:--")
+    kind = event.get("kind", "")
+    if kind == "BUY":
+        return f"{tm} {cfg.market} 매수 @{_fmt_price(event.get('price', 0))}"
+    if kind == "BUY_FAIL":
+        return f"{tm} {cfg.market} 매수실패 {event.get('detail', '')[:40]}"
+    if kind == "BUY_BLOCKED":
+        return f"{tm} {cfg.market} 매수보류 {event.get('detail', '')[:40]}"
+    if kind == "SELL_SL":
+        return (
+            f"{tm} {cfg.market} 손절 @{_fmt_price(event.get('price', 0))} "
+            f"{event.get('pnl_pct', 0):+.2f}%"
+        )
+    if kind == "SELL_TP":
+        return (
+            f"{tm} {cfg.market} 익절 @{_fmt_price(event.get('price', 0))} "
+            f"{event.get('pnl_pct', 0):+.2f}%"
+        )
+    if kind == "SELL_TP1":
+        return (
+            f"{tm} {cfg.market} TP1 @{_fmt_price(event.get('price', 0))} "
+            f"{event.get('pnl_pct', 0):+.2f}%"
+        )
+    if kind == "SELL_TIME":
+        return (
+            f"{tm} {cfg.market} 시간청산 @{_fmt_price(event.get('price', 0))} "
+            f"{event.get('pnl_pct', 0):+.2f}%"
+        )
+    if kind == "SELL_FAIL":
+        return f"{tm} {cfg.market} 매도실패 {event.get('detail', '')[:40]}"
+    if kind == "DUST":
+        return f"{tm} {cfg.market} 소액잔여 {event.get('value_krw', 0):,.0f}원"
+    return f"{tm} {cfg.market} {kind}"
+
+
+def _hourly_simple_activity(configs: list[MarketConfig]) -> tuple[str, list[str]]:
+    events: list[tuple[MarketConfig, dict]] = [
+        (cfg, event)
+        for cfg in configs
+        for event in _hourly_events.get(cfg.market, [])
+    ]
+    total = len(events)
+    trades = [
+        (cfg, event)
+        for cfg, event in events
+        if event.get("kind") in {
+            "BUY", "BUY_FAIL", "BUY_BLOCKED",
+            "SELL_SL", "SELL_TP", "SELL_TP1", "SELL_TIME", "SELL_FAIL",
+            "DUST",
+        }
+    ]
+    no_signal = sum(1 for _, event in events if event.get("kind") == "NO_SIGNAL")
+    out_of_session = sum(1 for _, event in events if event.get("kind") == "OUT_OF_SESSION")
+    holds = sum(1 for _, event in events if event.get("kind") == "HOLD")
+    summary = (
+        f"판단 {total}회 / 거래·시도 {len(trades)}회 / "
+        f"무신호 {no_signal}회 / 보유유지 {holds}회 / 세션외 {out_of_session}회"
+    )
+    logs = [_fmt_hourly_event(cfg, event) for cfg, event in trades[-12:]]
+    return summary, logs
 
 
 def _combined_status_msg(now: datetime, snapshots: dict, krw_balance: float,
                          configs: Optional[list[MarketConfig]] = None) -> str:
-    lines = [f"📊 자산현황 — {_ts_full(now)}", ""]
-    asset_value_total = 0.0
+    lines = [f"📊 시간별 요약 — {_ts_full(now)}", ""]
     active_configs = configs or MARKETS
     active_dynamic_slots = {
         slot for cfg in active_configs
         if (slot := _dynamic_slot(cfg)) is not None
     }
+    asset_value_total = 0.0
+    position_lines: list[str] = []
     for cfg in active_configs:
         snap = snapshots.get(cfg.market)
         if snap is None:
-            lines.append(f"━ {cfg.market} ({cfg.label}) ━")
-            lines.append("(데이터 미수집)")
-            lines.append("")
             continue
         account, state, cur_price, indic = snap
-        lines.append(_market_status_block(cfg, now, account, state, cur_price, indic))
-        lines.append("")
-        if has_position(account, cfg, cur_price):
-            asset_value_total += float(account[cfg.asset]["balance"]) * cur_price
+        value, line = _position_summary_line(cfg, account, state, cur_price, now)
+        asset_value_total += value
+        if line:
+            position_lines.append(line)
+
+    lines.append("[전체 자산]")
+    lines.append(f"총평가: {asset_value_total + krw_balance:,.0f}원")
+    lines.append(f"KRW: {krw_balance:,.0f}원 / 코인: {asset_value_total:,.0f}원")
+    lines.append(f"보유: {len(position_lines)}개")
+    if position_lines:
+        lines.extend(position_lines[:6])
+        if len(position_lines) > 6:
+            lines.append(f"- 외 {len(position_lines) - 6}개")
+    else:
+        lines.append("- 보유 포지션 없음")
+    lines.append("")
+
+    lines.append("[지난 1시간 판단/매매]")
+    summary, trade_logs = _hourly_simple_activity(active_configs)
+    lines.append(summary)
+    if trade_logs:
+        lines.extend(f"- {log}" for log in trade_logs)
+    else:
+        lines.append("- 매매/주문시도 없음")
+
     failed = [
         (slot, meta) for slot, meta in _dynamic_top_gainer_meta.items()
         if meta.get("status") == "failed" and slot not in active_dynamic_slots
     ]
     if failed:
-        lines.append("━ 동적 슬롯 (TOP_GAINER) ━")
-        for slot, meta in failed:
-            lines.append(f"TOP{slot} 선정 실패: {meta.get('last_error', '')[:80]}")
         lines.append("")
-
-    # 자산 합계
-    lines.append("━━━ 자산 합계 ━━━")
-    lines.append(f"💰 KRW: {krw_balance:,.0f}원")
-    lines.append(f"💼 코인평가: {asset_value_total:,.0f}원")
-    lines.append(f"📊 총평가: {asset_value_total + krw_balance:,.0f}원")
-    lines.append("")
-
-    # 1시간 투자 판단 요약
-    lines.append("━━━ 지난 1시간 투자 판단 요약 ━━━")
-    for cfg in active_configs:
-        lines.append(_hourly_activity_block(cfg))
+        lines.append("[TOP 선정 실패]")
+        for slot, meta in failed:
+            lines.append(f"- TOP{slot}: {meta.get('last_error', '')[:80]}")
     return "\n".join(lines)
 
 
@@ -822,7 +1040,7 @@ def _startup_msg(now: datetime) -> str:
         parts.extend([
             f"━ {cfg.market} ({cfg.label}) ━",
             f"  진입시간: {_fmt_session(cfg)}",
-            f"  시그널: vol×{cfg.vol_mult}, atr×{cfg.atr_mult}, lb={cfg.lb}, vbase={cfg.vol_baseline}",
+            f"  시그널: {cfg.entry_kind}, vol×{cfg.vol_mult}, atr×{cfg.atr_mult}, lb={cfg.lb}, vbase={cfg.vol_baseline}",
             f"  청산: TP={cfg.take_profit}%, SL={cfg.stop_loss}%, 보유한도={cfg.max_hold_bars}봉 ({cfg.max_hold_bars*5/60:.0f}h)",
             tp1_str,
             "  매수한도: 현재 가용 KRW 잔고 전체",
@@ -833,9 +1051,11 @@ def _startup_msg(now: datetime) -> str:
         "",
         "━ 동적 슬롯 (TOP_GAINER ×2) ━",
         "  대상: KRW 마켓 전일대비 상승률 TOP 2 (고정 3개 시장 제외)",
-        "  갱신: 30분마다 재선정",
+        "  갱신: 매분 재선정",
         "  보유정책: 슬롯별 보유 중 강제 교체 없음 (TP/SL/시간청산까지 유지)",
-        "  전략: 거래기회 확대형 5분봉 변동성 돌파 (vol×2.5, atr×1.0, TP=2.0%, SL=1.5%)",
+        f"  전략: {TOP_GAINER_CFG_TEMPLATE['entry_kind']} "
+        f"(vol×{TOP_GAINER_CFG_TEMPLATE['vol_mult']}, atr×{TOP_GAINER_CFG_TEMPLATE['atr_mult']}, "
+        f"TP={TOP_GAINER_CFG_TEMPLATE['take_profit']}%, SL={TOP_GAINER_CFG_TEMPLATE['stop_loss']}%)",
     ])
     return "\n".join(parts)
 
@@ -936,7 +1156,8 @@ def trade_one_market(cfg: MarketConfig, now: datetime, account: dict
     pos = has_position(account, cfg, cur_price)
     logger.info(
         f"[{cfg.market}] pos={'LONG' if pos else 'NONE'}  close={cur_price:.5f}  "
-        f"vol_ratio={indic['vol_ratio']:.2f}  bt={indic['bt']:.5f}"
+        f"entry_kind={cfg.entry_kind}  signal={indic['entry_signal']}  "
+        f"{_fmt_entry_signal(cfg, indic)}"
     )
 
     # ─────────────── 포지션 있음 ───────────────
@@ -962,6 +1183,11 @@ def trade_one_market(cfg: MarketConfig, now: datetime, account: dict
                                         pnl_pct, pnl_krw_total))
                 _record_event(cfg.market, "SELL_SL", time_str,
                               price=cur_price, pnl_pct=pnl_pct, pnl_krw=pnl_krw_total)
+                if _is_dynamic_cfg(cfg):
+                    cooldown_until = _set_top_gainer_cooldown(cfg.market, now)
+                    logger.info(
+                        f"[{cfg.market}] TOP_GAINER 손절 쿨다운 설정 until={cooldown_until.isoformat()}"
+                    )
                 clear_state(cfg)
                 account = get_account_info()
             else:
@@ -997,7 +1223,8 @@ def trade_one_market(cfg: MarketConfig, now: datetime, account: dict
             if tp1_est_krw >= MIN_ORDER_KRW:
                 sell_qty_str = truncate_qty(tp1_qty)
                 logger.info(
-                    f"[{cfg.market}] [SELL] TP1 {cfg.tp1_ratio*100:.0f}%  qty={sell_qty_str}"
+                    f"[{cfg.market}] [SELL] TP1 {cfg.tp1_ratio*100:.0f}%  "
+                    f"price={cur_price:.5f}  buy={buy_price:.5f}  qty={sell_qty_str}"
                 )
                 res = sell_market(cfg.market, sell_qty_str)
                 ok, reason = _check_order(res)
@@ -1028,7 +1255,10 @@ def trade_one_market(cfg: MarketConfig, now: datetime, account: dict
 
         # 4. 시간 청산
         if hold_bars >= cfg.max_hold_bars:
-            logger.info(f"[{cfg.market}] [SELL] 시간청산  hold_bars={hold_bars}/{cfg.max_hold_bars}")
+            logger.info(
+                f"[{cfg.market}] [SELL] 시간청산  price={cur_price:.5f}  buy={buy_price:.5f}  "
+                f"hold_bars={hold_bars}/{cfg.max_hold_bars}"
+            )
             res = sell_market(cfg.market, bal_str)
             ok, reason = _check_order(res)
             if ok:
@@ -1052,6 +1282,11 @@ def trade_one_market(cfg: MarketConfig, now: datetime, account: dict
 
     # ─────────────── 포지션 없음 ───────────────
     if state.get("buy_price", 0) > 0:
+        dust_value = _position_value_krw(account, cfg, cur_price)
+        if 0 < dust_value < MIN_ORDER_KRW:
+            state = _mark_dust_position(cfg, state, cur_price, now)
+            _record_event(cfg.market, "DUST", time_str, price=cur_price, value_krw=dust_value)
+            return account, state, cur_price, indic
         logger.info(f"[{cfg.market}] 포지션없음 + 상태파일 잔존 → 초기화")
         clear_state(cfg)
         state = _default_state()
@@ -1061,16 +1296,16 @@ def trade_one_market(cfg: MarketConfig, now: datetime, account: dict
         _record_event(cfg.market, "OUT_OF_SESSION", time_str)
         return account, state, cur_price, indic
 
-    entry = (cur_price > indic["bt"]) and (indic["vol_ratio"] >= cfg.vol_mult)
+    entry = bool(indic["entry_signal"])
     logger.info(
         f"[{cfg.market}] 진입신호={entry}  "
-        f"(close={cur_price:.5f} vs bt={indic['bt']:.5f}, "
-        f"vol_ratio={indic['vol_ratio']:.2f} vs {cfg.vol_mult})"
+        f"({_fmt_entry_signal(cfg, indic)})"
     )
     if not entry:
         bt_gap_pct = (indic["bt"] / cur_price - 1) * 100 if cur_price > 0 else 0.0
         _record_event(cfg.market, "NO_SIGNAL", time_str,
-                      price=cur_price, vol_ratio=indic["vol_ratio"], bt_gap_pct=bt_gap_pct)
+                      price=cur_price, vol_ratio=indic["vol_ratio"],
+                      bt_gap_pct=bt_gap_pct, entry_kind=cfg.entry_kind)
         return account, state, cur_price, indic
 
     signal_candle = indic.get("candle_time")
@@ -1186,14 +1421,14 @@ if __name__ == "__main__":
     logger.info("++++++++++ Multi-Market 5분봉 (XRP/ETH/BTC) starts. ++++++++++")
     for cfg in MARKETS:
         logger.info(
-            f"  {cfg.market} ({cfg.label}): vol={cfg.vol_mult} atr={cfg.atr_mult} "
+            f"  {cfg.market} ({cfg.label}): entry={cfg.entry_kind} vol={cfg.vol_mult} atr={cfg.atr_mult} "
             f"vbase={cfg.vol_baseline} lb={cfg.lb}  "
             f"hold={cfg.max_hold_bars}  TP={cfg.take_profit}% SL={cfg.stop_loss}%  "
             f"tp1={cfg.tp1_pct}/{cfg.tp1_ratio}  ses={cfg.session}/{cfg.weekday}  "
             "max_buy=current_available_krw"
         )
     logger.info(
-        "  TOP_GAINER x2: KRW ticker/all signed_change_rate TOP2, 30m refresh, "
+        "  TOP_GAINER x2: KRW ticker/all signed_change_rate TOP2, 1m refresh, "
         "no forced rotation while holding"
     )
 

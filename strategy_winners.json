@@ -1,0 +1,86 @@
+{
+  "description": "백테스트 검증 후 실거래에 반영할 종목별 winner 설정. 현재 값은 기존 실거래 파라미터를 동일하게 보존한 baseline입니다.",
+  "market_configs": {
+    "KRW-XRP": {
+      "label": "XRP v3",
+      "entry_kind": "volatility_breakout",
+      "breakout_volume_mult": 1.5,
+      "atr_breakout_mult": 1.5,
+      "atr_window": 14,
+      "volume_baseline_window": 10,
+      "breakout_lookback": 10,
+      "take_profit": 2.0,
+      "stop_loss": 1.5,
+      "max_hold_bars": 60,
+      "tp1_pct": 1.2,
+      "tp1_ratio": 0.7,
+      "session": "kr_night",
+      "weekday": "weekday"
+    },
+    "KRW-ETH": {
+      "label": "ETH freq-balanced",
+      "entry_kind": "volatility_breakout",
+      "breakout_volume_mult": 1.5,
+      "atr_breakout_mult": 1.0,
+      "atr_window": 14,
+      "volume_baseline_window": 20,
+      "breakout_lookback": 10,
+      "take_profit": 2.0,
+      "stop_loss": 1.5,
+      "max_hold_bars": 60,
+      "tp1_pct": 0.0,
+      "tp1_ratio": 0.5,
+      "session": "kr_night",
+      "weekday": "weekday",
+      "selection_metrics": {
+        "window": "1y",
+        "return_pct": 27.45,
+        "buy_and_hold_return_pct": 31.89,
+        "sharpe_per_bar": 1.4713,
+        "profit_factor": 1.2804,
+        "max_drawdown_pct": -10.84,
+        "completed_round_trips": 160,
+        "win_rate_pct": 51.88,
+        "exposure_pct": 7.0,
+        "reason": "거래빈도 균형 후보"
+      }
+    },
+    "KRW-BTC": {
+      "label": "BTC W1",
+      "entry_kind": "volatility_breakout",
+      "breakout_volume_mult": 2.5,
+      "atr_breakout_mult": 2.0,
+      "atr_window": 14,
+      "volume_baseline_window": 10,
+      "breakout_lookback": 10,
+      "take_profit": 3.0,
+      "stop_loss": 2.0,
+      "max_hold_bars": 48,
+      "tp1_pct": 0.0,
+      "tp1_ratio": 0.5,
+      "session": "kr_day",
+      "weekday": "all"
+    },
+    "TOP_GAINER": {
+      "entry_kind": "volatility_breakout",
+      "breakout_volume_mult": 2.5,
+      "atr_breakout_mult": 1.0,
+      "atr_window": 14,
+      "volume_baseline_window": 10,
+      "breakout_lookback": 10,
+      "take_profit": 2.5,
+      "stop_loss": 1.0,
+      "max_hold_bars": 36,
+      "tp1_pct": 0.0,
+      "tp1_ratio": 0.5,
+      "session": "all",
+      "weekday": "all",
+      "selection_filters": {
+        "min_acc_trade_price_24h": 1000000000,
+        "max_orderbook_spread_pct": 0.35,
+        "stop_loss_cooldown_minutes": 30,
+        "reason": "공격형 유지: 거래빈도는 유지하되 저유동성/넓은 스프레드/손절 직후 재진입을 차단"
+      }
+    }
+  }
+}
