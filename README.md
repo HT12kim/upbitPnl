@@ -232,6 +232,116 @@ DASHBOARD_PORT=8081 python3 -m dashboard.server
 - 배포 시에는 API 키가 서버 환경 변수에만 존재하도록 구성하고, 정적 파일에 키를 노출하지 마세요.
 - 현재 프론트엔드는 빠른 로컬 검증을 위해 Tailwind CDN을 사용합니다. 운영 배포에서는 Tailwind CLI/PostCSS 빌드 또는 Next.js 프론트엔드로 분리하는 구성을 권장합니다.
 
+## Netlify + 로컬 API 연동
+
+Netlify에는 정적 프론트만 배포하고, 실제 잔고/주문/로그 API는 내 PC에서 실행하는 구조입니다.
+
+```text
+Netlify 정적 프론트
+  -> /api/* 요청
+  -> Netlify _redirects
+  -> Cloudflare Tunnel HTTPS 주소
+  -> 내 PC의 dashboard.server
+```
+
+### Netlify Build settings
+
+Netlify 사이트 설정은 다음처럼 둡니다.
+
+```text
+Base directory: 비워둠
+Build command: 비워둠
+Publish directory: dashboard/static
+```
+
+`dashboard/static/_redirects`가 Netlify의 `/api/*` 요청을 현재 Cloudflare Tunnel 주소로 프록시합니다.
+
+```text
+/api/*  https://cohen-profession-spiritual-chronicles.trycloudflare.com/api/:splat  200
+```
+
+Cloudflare Quick Tunnel 주소는 임시 주소입니다. `cloudflared tunnel --url ...`을 다시 실행하면 주소가 바뀔 수 있습니다. 주소가 바뀌면 `_redirects`의 도메인을 새 주소로 바꾼 뒤 커밋/푸시하고 Netlify를 재배포해야 합니다.
+
+### 터미널 실행 순서
+
+터미널 1: 로컬 API 서버 실행
+
+```shell
+cd /Users/ht_mac_mini/Documents/dev/git_btc_try2/UPbitAutoTrading-main
+DASHBOARD_ALLOWED_ORIGINS="*" python3 -m dashboard.server
+```
+
+특정 Netlify 도메인만 허용하려면 `*` 대신 실제 Netlify 주소를 넣습니다.
+
+```shell
+DASHBOARD_ALLOWED_ORIGINS="https://YOUR-SITE.netlify.app" python3 -m dashboard.server
+```
+
+터미널 2: Cloudflare Tunnel 실행
+
+```shell
+cloudflared tunnel --url http://127.0.0.1:8080
+```
+
+`cloudflared`가 없다면 Homebrew로 설치합니다.
+
+```shell
+brew install cloudflared
+cloudflared --version
+```
+
+터미널 3: 터널 API 확인
+
+```shell
+curl "https://cohen-profession-spiritual-chronicles.trycloudflare.com/api/overview?limit=1"
+```
+
+정상이라면 JSON이 출력됩니다. `<!DOCTYPE html>`이 나오면 API가 아니라 HTML을 받은 것이므로 터널 주소나 `_redirects` 설정을 다시 확인해야 합니다.
+
+### Netlify 접속 방법
+
+`_redirects`가 최신 터널 주소를 가리키고 있으면 기본 Netlify 주소만 접속하면 됩니다.
+
+```text
+https://YOUR-SITE.netlify.app
+```
+
+프론트에서 임시로 다른 API 주소를 쓰고 싶으면 `api` 쿼리 파라미터를 사용할 수 있습니다.
+
+```text
+https://YOUR-SITE.netlify.app/?api=https://새로운-터널주소.trycloudflare.com
+```
+
+이 값은 브라우저 `localStorage`에 저장됩니다. 잘못된 주소가 저장됐다면 브라우저 개발자 콘솔에서 아래 명령으로 초기화합니다.
+
+```javascript
+localStorage.removeItem("UPBIT_API_BASE_URL")
+```
+
+### 자주 나는 오류
+
+`ERR_NAME_NOT_RESOLVED`
+
+```text
+Cloudflare Tunnel 주소가 만료됐거나 cloudflared 프로세스가 꺼진 상태입니다.
+cloudflared tunnel --url http://127.0.0.1:8080 을 다시 실행하고 새 주소로 _redirects를 갱신하세요.
+```
+
+`Unexpected token '<', "<!DOCTYPE "... is not valid JSON`
+
+```text
+API가 JSON이 아니라 HTML을 반환한 상태입니다.
+대부분 Netlify index.html, Cloudflare 에러 페이지, 또는 잘못된 터널 주소를 받은 경우입니다.
+curl "터널주소/api/overview?limit=1" 로 JSON 출력 여부를 먼저 확인하세요.
+```
+
+`curl: (6) Could not resolve host: https`
+
+```text
+URL에 https://를 두 번 입력한 경우가 많습니다.
+curl "https://도메인.trycloudflare.com/api/overview?limit=1" 처럼 한 번만 입력하세요.
+```
+
 ## 스케줄
 
 `APScheduler`의 `BackgroundScheduler`를 사용합니다.
