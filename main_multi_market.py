@@ -187,7 +187,7 @@ BTC_CFG = MarketConfig(
 MARKETS: list[MarketConfig] = [XRP_CFG, ETH_CFG, BTC_CFG]
 FIXED_MARKET_CODES = {cfg.market for cfg in MARKETS}
 MIN_ORDER_KRW = 5_000
-MAX_CONCURRENT_POSITIONS = 3
+MAX_CONCURRENT_POSITIONS = 2
 UPBIT_TICKER_ALL_URL = "https://api.upbit.com/v1/ticker/all"
 UPBIT_CANDLE_5M_URL = "https://api.upbit.com/v1/candles/minutes/5"
 TOP_GAINER_STATE_FILE = STATE_DIR / "top_gainer_state.json"
@@ -694,10 +694,10 @@ def _active_position_count(account: dict) -> int:
 
 def _buy_budget_krw(account: dict) -> tuple[int, int, int]:
     """
-    최대 동시 3종목 운용을 위한 1회 매수 금액을 계산한다.
+    최대 동시 2종목 운용을 위한 1회 매수 금액을 계산한다.
 
-    남은 슬롯 수로 현재 가용 KRW를 나누므로 0개 보유 시 1/3,
-    1개 보유 시 1/2, 2개 보유 시 남은 금액 전체를 사용한다.
+    남은 슬롯 수로 현재 가용 KRW를 나누므로 0개 보유 시 1/2,
+    1개 보유 시 남은 금액 전체를 사용한다.
     """
     active_count = _active_position_count(account)
     remaining_slots = MAX_CONCURRENT_POSITIONS - active_count
@@ -1354,7 +1354,7 @@ def trade_one_market(cfg: MarketConfig, now: datetime, account: dict
     state["last_entry_signal_candle"] = signal_candle
     save_state(cfg, state)
 
-    # 매수 가능 KRW 결정: 최대 3개 동시 보유를 위해 남은 슬롯 수로 가용 KRW를 배분한다.
+    # 매수 가능 KRW 결정: 최대 2개 동시 보유를 위해 남은 슬롯 수로 가용 KRW를 배분한다.
     krw_use, active_positions, remaining_slots = _buy_budget_krw(account)
     if remaining_slots <= 0:
         msg = f"동시 보유 한도 도달({active_positions}/{MAX_CONCURRENT_POSITIONS})"

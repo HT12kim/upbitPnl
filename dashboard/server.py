@@ -25,6 +25,8 @@ PRICE_CACHE: dict[str, float] = {}
 
 load_dotenv(BASE_DIR / ".env")
 
+DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
+
 
 @dataclass(frozen=True)
 class DashboardMarket:
@@ -293,8 +295,6 @@ def _log_trade_history(limit: int = 60) -> list[dict[str, Any]]:
             continue
 
         item = match.groupdict()
-        if (item["time"][:16], item["market"]) in failed_keys:
-            continue
         action = item["action"]
         message = item.get("message", "")
         market = item["market"]
@@ -643,13 +643,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _allowed_cors_origin(self) -> str | None:
         origin = self.headers.get("Origin")
-        allowed_raw = os.getenv("DASHBOARD_ALLOWED_ORIGINS", "*")
+        allowed_raw = os.getenv("DASHBOARD_ALLOWED_ORIGINS", "http://127.0.0.1:8080,http://localhost:8080")
         allowed = {item.strip() for item in allowed_raw.split(",") if item.strip()}
-        if "*" in allowed:
-            return origin or "*"
         if origin and origin in allowed:
             return origin
         return None
+
+    def _is_authorized(self) -> bool:
+        """DASHBOARD_TOKEN이 설정된 경우 API 접근에 bearer token을 요구한다."""
+        if not DASHBOARD_TOKEN:
+            return True
+        expected = f"Bearer {DASHBOARD_TOKEN}"
+        return self.headers.get("Authorization", "") == expected
 
     def _send_cors_headers(self) -> None:
         origin = self._allowed_cors_origin()
@@ -669,6 +674,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/overview":
+            if not self._is_authorized():
+                self._json_response(lambda: {"error": "unauthorized"}, status=HTTPStatus.UNAUTHORIZED)
+                return
             query = parse_qs(parsed.query)
             limit = int(query.get("limit", ["30"])[0])
             self._json_response(lambda: build_overview(limit=max(1, min(limit, 100))))
@@ -687,16 +695,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[dashboard] {self.address_string()} - {fmt % args}")
 
-    def _json_response(self, factory: Any) -> None:
+    def _json_response(self, factory: Any, status: HTTPStatus | None = None) -> None:
         try:
             payload = factory()
-            status = HTTPStatus.OK
+            response_status = status or HTTPStatus.OK
         except Exception as exc:
             payload = {"error": str(exc), "type": type(exc).__name__}
-            status = HTTPStatus.INTERNAL_SERVER_ERROR
+            response_status = HTTPStatus.INTERNAL_SERVER_ERROR
 
         body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
-        self.send_response(status)
+        self.send_response(response_status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self._send_cors_headers()

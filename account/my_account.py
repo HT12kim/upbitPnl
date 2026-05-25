@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+UPBIT_TIMEOUT_SECONDS = 5
+
 """
 # 전체 계좌 조회
 URL: https://docs.upbit.com/reference/%EC%A0%84%EC%B2%B4-%EA%B3%84%EC%A2%8C-%EC%A1%B0%ED%9A%8C
@@ -31,5 +33,7 @@ def get_my_exchange_account():
     authorization = 'Bearer {}'.format(jwt.encode({'access_key': access_key, 'nonce': str(uuid.uuid4())}, secret_key))
     headers = {"Authorization": authorization}
 
-    my_exchange_account = pd.DataFrame(requests.get(my_account_url, headers=headers).json())
+    response = requests.get(my_account_url, headers=headers, timeout=UPBIT_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    my_exchange_account = pd.DataFrame(response.json())
     return my_exchange_account

@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+UPBIT_TIMEOUT_SECONDS = 5
+
 # Authorization
 # Key: access_key, secret_key
 access_key = os.getenv('ACCESS_KEY', '')
@@ -76,8 +78,14 @@ def buy_market(market: str, price: int) -> pd.DataFrame:
         "Authorization": bm_authorization
     }
 
-    buy_market_order_data = pd.DataFrame.from_dict(
-        requests.post(buy_market_url, json=buy_market_params, headers=bm_headers).json(), orient='index').T
+    response = requests.post(
+        buy_market_url,
+        json=buy_market_params,
+        headers=bm_headers,
+        timeout=UPBIT_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    buy_market_order_data = pd.DataFrame.from_dict(response.json(), orient='index').T
 
     return buy_market_order_data
 
@@ -111,8 +119,14 @@ def sell_market(market: str, volume: str) -> pd.DataFrame:
         "Authorization": sm_authorization
     }
 
-    sell_market_order_data = pd.DataFrame.from_dict(
-        requests.post(sell_market_url, json=sell_market_params, headers=bm_headers).json(), orient='index').T
+    response = requests.post(
+        sell_market_url,
+        json=sell_market_params,
+        headers=bm_headers,
+        timeout=UPBIT_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    sell_market_order_data = pd.DataFrame.from_dict(response.json(), orient='index').T
 
     return sell_market_order_data
 
@@ -184,7 +198,14 @@ def get_open_order(market: str, state: str) -> pd.DataFrame:
         "Authorization": oo_authorization
     }
 
-    open_order_data = pd.DataFrame(requests.get(open_order_url, json=open_order_params, headers=oo_headers).json())
+    response = requests.get(
+        open_order_url,
+        json=open_order_params,
+        headers=oo_headers,
+        timeout=UPBIT_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    open_order_data = pd.DataFrame(response.json())
 
     return open_order_data
 
