@@ -188,7 +188,9 @@ MARKETS: list[MarketConfig] = [XRP_CFG, ETH_CFG, BTC_CFG]
 FIXED_MARKET_CODES = {cfg.market for cfg in MARKETS}
 MIN_ORDER_KRW = 5_000
 MAX_CONCURRENT_POSITIONS = 2
+REBALANCE_PROFIT_THRESHOLD_PCT = 0.1
 UPBIT_TICKER_ALL_URL = "https://api.upbit.com/v1/ticker/all"
+UPBIT_TICKER_URL = "https://api.upbit.com/v1/ticker"
 UPBIT_CANDLE_5M_URL = "https://api.upbit.com/v1/candles/minutes/5"
 TOP_GAINER_STATE_FILE = STATE_DIR / "top_gainer_state.json"
 TOP_GAINER_2_STATE_FILE = STATE_DIR / "top_gainer_2_state.json"
@@ -694,17 +696,61 @@ def _active_position_count(account: dict) -> int:
 
 def _buy_budget_krw(account: dict) -> tuple[int, int, int]:
     """
-    최대 동시 2종목 운용을 위한 1회 매수 금액을 계산한다.
+    최대 동시 2종목 운용을 위한 신규 현금 매수 금액을 계산한다.
 
-    남은 슬롯 수로 현재 가용 KRW를 나누므로 0개 보유 시 1/2,
-    1개 보유 시 남은 금액 전체를 사용한다.
+    0개 보유 시에는 가용 KRW 전액을 사용한다. 1개 보유 시에는 기존
+    포지션 50% 리밸런싱 매도 성공분만 신규 매수 예산으로 사용하므로
+    여기서는 0원을 반환한다.
     """
     active_count = _active_position_count(account)
     remaining_slots = MAX_CONCURRENT_POSITIONS - active_count
     if remaining_slots <= 0:
         return 0, active_count, 0
     krw_available = int(account.get("krw_available", 0))
-    return math.floor(krw_available / remaining_slots), active_count, remaining_slots
+    if active_count == 0:
+        return krw_available, active_count, remaining_slots
+    return 0, active_count, remaining_slots
+
+
+def _active_positions(account: dict, exclude_asset: Optional[str] = None) -> list[dict]:
+    """최소주문 금액 이상 보유 중인 포지션 정보를 반환한다."""
+    positions: list[dict] = []
+    for asset, row in account.items():
+        if asset in {"KRW", "krw_balance", "krw_available"} or asset == exclude_asset:
+            continue
+        if not isinstance(row, dict):
+            continue
+        try:
+            balance = float(row.get("balance", 0))
+            avg_price = float(row.get("avg_buy_price", 0))
+        except (TypeError, ValueError):
+            continue
+        if balance > 0 and avg_price > 0 and balance * avg_price >= MIN_ORDER_KRW:
+            positions.append({
+                "asset": asset,
+                "market": f"KRW-{asset}",
+                "balance": balance,
+                "avg_buy_price": avg_price,
+            })
+    return positions
+
+
+def _fetch_current_price(market: str, timeout_s: float = 3.0) -> float:
+    """리밸런싱 판단용 현재가를 Upbit ticker에서 조회한다."""
+    res = requests.get(
+        UPBIT_TICKER_URL,
+        params={"markets": market},
+        headers={"Accept": "application/json"},
+        timeout=timeout_s,
+    )
+    res.raise_for_status()
+    rows = res.json()
+    if not isinstance(rows, list) or not rows:
+        raise ValueError(f"{market} ticker 응답이 비어 있습니다.")
+    price = float(rows[0].get("trade_price", 0))
+    if price <= 0:
+        raise ValueError(f"{market} 현재가가 유효하지 않습니다: {price}")
+    return price
 
 
 def has_position(account: dict, cfg: MarketConfig, price: Optional[float] = None) -> bool:
@@ -881,15 +927,18 @@ def _fmt_entry_signal(cfg: MarketConfig, indic: dict) -> str:
 # ── 텔레그램 메시지: 매매 알림 ─────────────────────────────────────────────
 
 def _msg_buy(cfg: MarketConfig, now: datetime, buy_price: float,
-             krw_used: int, qty: float, krw_remaining: float) -> str:
+             krw_used: int, qty: float, krw_remaining: float,
+             label: str = "매수 체결", note: str = "") -> str:
     lines = [
-        f"🟢 매수 체결 — {cfg.market} ({cfg.label})",
+        f"🟢 {label} — {cfg.market} ({cfg.label})",
         f"시각: {_ts_short(now)}",
         f"매수가: {_fmt_price(buy_price)}",
         f"수량: {qty:.4f} {cfg.asset}",
-        f"투자금: {krw_used:,}원 (최대 {MAX_CONCURRENT_POSITIONS}종목 슬롯 배분)",
+        f"투자금: {krw_used:,}원",
         f"잔여 KRW: {krw_remaining:,.0f}원",
     ]
+    if note:
+        lines.append(note)
     reason = _dynamic_reason_line(cfg)
     if reason:
         lines.append(reason)
@@ -912,6 +961,21 @@ def _msg_sell(cfg: MarketConfig, now: datetime, reason_label: str, icon: str,
     if reason:
         lines.append(reason)
     return "\n".join(lines)
+
+
+def _msg_rebalance_sell(now: datetime, market: str, asset: str,
+                        sell_price: float, buy_price: float, qty: float,
+                        pnl_pct: float, pnl_krw: float,
+                        krw_budget: int, target_market: str) -> str:
+    return "\n".join([
+        f"리밸런싱 50% 매도 — {market}",
+        f"시각: {_ts_short(now)}",
+        f"매도가: {_fmt_price(sell_price)}  평단: {_fmt_price(buy_price)}",
+        f"수량: {qty:.8f} {asset}",
+        f"PnL: {_fmt_pnl(pnl_pct, pnl_krw)}",
+        f"확보 KRW: {krw_budget:,}원",
+        f"신규 매수 대상: {target_market}",
+    ])
 
 
 def _msg_fail(cfg: MarketConfig, now: datetime, action: str, reason: str) -> str:
@@ -958,6 +1022,13 @@ def _fmt_hourly_event(cfg: MarketConfig, event: dict) -> str:
         return f"{tm} {cfg.market} 매수실패 {event.get('detail', '')[:40]}"
     if kind == "BUY_BLOCKED":
         return f"{tm} {cfg.market} 매수보류 {event.get('detail', '')[:40]}"
+    if kind == "REBALANCE_SELL":
+        return (
+            f"{tm} {cfg.market} 리밸런싱매도 {event.get('source_market', '')} "
+            f"{event.get('pnl_pct', 0):+.2f}% 확보 {event.get('krw_budget', 0):,.0f}원"
+        )
+    if kind == "REBALANCE_BLOCKED":
+        return f"{tm} {cfg.market} 리밸런싱보류 {event.get('detail', '')[:40]}"
     if kind == "SELL_SL":
         return (
             f"{tm} {cfg.market} 손절 @{_fmt_price(event.get('price', 0))} "
@@ -997,6 +1068,7 @@ def _hourly_simple_activity(configs: list[MarketConfig]) -> tuple[str, list[str]
         for cfg, event in events
         if event.get("kind") in {
             "BUY", "BUY_FAIL", "BUY_BLOCKED",
+            "REBALANCE_SELL", "REBALANCE_BLOCKED",
             "SELL_SL", "SELL_TP", "SELL_TP1", "SELL_TIME", "SELL_FAIL",
             "DUST",
         }
@@ -1077,10 +1149,13 @@ def _startup_msg(now: datetime) -> str:
             f"  시그널: {cfg.entry_kind}, vol×{cfg.vol_mult}, atr×{cfg.atr_mult}, lb={cfg.lb}, vbase={cfg.vol_baseline}",
             f"  청산: TP={cfg.take_profit}%, SL={cfg.stop_loss}%, 보유한도={cfg.max_hold_bars}봉 ({cfg.max_hold_bars*5/60:.0f}h)",
             tp1_str,
-            f"  매수한도: 최대 {MAX_CONCURRENT_POSITIONS}종목 슬롯 배분",
+            f"  매수한도: 최대 {MAX_CONCURRENT_POSITIONS}종목, 0개 보유 시 전액 매수",
             "",
         ])
-    parts.append(f"총 매수한도: 최대 {MAX_CONCURRENT_POSITIONS}종목 동시 보유 기준 슬롯 배분")
+    parts.append(
+        f"총 매수한도: 최대 {MAX_CONCURRENT_POSITIONS}종목, "
+        f"1개 보유 시 수익 포지션 50% 리밸런싱 후 신규 매수"
+    )
     parts.extend([
         "",
         "━ 동적 슬롯 (TOP_GAINER ×2) ━",
@@ -1172,6 +1247,92 @@ def _fetch_candles_with_retry(market: str, attempts: int = 3, sleep_s: float = 1
             if attempt < attempts - 1:
                 time.sleep(sleep_s * (attempt + 1))   # 1s, 2s, ...
     raise last_err if last_err else RuntimeError("candle fetch unknown error")
+
+
+def _try_rebalance_for_new_buy(cfg: MarketConfig, now: datetime, account: dict,
+                               time_str: str) -> tuple[dict, int, bool]:
+    """
+    1개 보유 상태에서 신규 매수 신호가 발생하면 기존 수익 포지션의 50%를 매도한다.
+    반환값은 (최신 account, 신규 매수 예산, 매수 진행 가능 여부)이다.
+    """
+    positions = _active_positions(account, exclude_asset=cfg.asset)
+    if len(positions) != 1:
+        msg = "리밸런싱 대상 기존 포지션 없음"
+        logger.warning(f"[{cfg.market}] {msg}")
+        _record_event(cfg.market, "REBALANCE_BLOCKED", time_str, detail=msg)
+        return account, 0, False
+
+    pos = positions[0]
+    source_market = pos["market"]
+    try:
+        source_price = _fetch_current_price(source_market)
+    except Exception as e:
+        msg = f"기존 포지션 현재가 조회 실패: {e}"
+        logger.warning(f"[{cfg.market}] {msg}")
+        send_telegram(_msg_fail(cfg, now, "리밸런싱", msg))
+        _record_event(cfg.market, "REBALANCE_BLOCKED", time_str, detail=msg)
+        return account, 0, False
+
+    avg_price = pos["avg_buy_price"]
+    balance = pos["balance"]
+    pnl_pct = (source_price / avg_price - 1.0) * 100.0 if avg_price > 0 else 0.0
+    if pnl_pct < REBALANCE_PROFIT_THRESHOLD_PCT:
+        msg = (
+            f"기존 포지션 미수익({source_market} {pnl_pct:+.2f}% "
+            f"< {REBALANCE_PROFIT_THRESHOLD_PCT:.2f}%)"
+        )
+        logger.info(f"[{cfg.market}] {msg}")
+        _record_event(cfg.market, "REBALANCE_BLOCKED", time_str, detail=msg)
+        return account, 0, False
+
+    sell_qty = float(truncate_qty(balance * 0.5))
+    sell_est_krw = sell_qty * source_price
+    if sell_qty <= 0 or sell_est_krw < MIN_ORDER_KRW:
+        msg = f"부분매도 금액 최소주문 미만({sell_est_krw:,.0f}원 < {MIN_ORDER_KRW:,}원)"
+        logger.info(f"[{cfg.market}] {msg}")
+        _record_event(cfg.market, "REBALANCE_BLOCKED", time_str, detail=msg)
+        return account, 0, False
+
+    before_krw_available = int(account.get("krw_available", 0))
+    sell_qty_str = truncate_qty(sell_qty)
+    logger.info(
+        f"[{cfg.market}] [REBALANCE] {source_market} 50% 매도 시도 "
+        f"qty={sell_qty_str} price={source_price:.5f} pnl={pnl_pct:+.2f}%"
+    )
+    res = sell_market(source_market, sell_qty_str)
+    ok, reason = _check_order(res)
+    if not ok:
+        msg = f"리밸런싱 50% 매도 실패: {reason}"
+        logger.error(f"[{cfg.market}] {msg}")
+        send_telegram(_msg_fail(cfg, now, "리밸런싱", msg))
+        _record_event(cfg.market, "REBALANCE_BLOCKED", time_str, detail=msg)
+        return account, 0, False
+
+    time.sleep(2)
+    new_account = get_account_info()
+    krw_budget = max(int(new_account.get("krw_available", 0)) - before_krw_available, 0)
+    pnl_krw = (source_price - avg_price) * sell_qty
+    send_telegram(_msg_rebalance_sell(
+        now, source_market, pos["asset"], source_price, avg_price,
+        sell_qty, pnl_pct, pnl_krw, krw_budget, cfg.market,
+    ))
+    _record_event(
+        cfg.market, "REBALANCE_SELL", time_str,
+        source_market=source_market, price=source_price,
+        pnl_pct=pnl_pct, pnl_krw=pnl_krw, krw_budget=krw_budget,
+    )
+    if krw_budget < MIN_ORDER_KRW:
+        msg = f"리밸런싱 확보금 최소주문 미만({krw_budget:,}원 < {MIN_ORDER_KRW:,}원)"
+        logger.warning(f"[{cfg.market}] {msg}")
+        send_telegram(_msg_fail(cfg, now, "매수", msg))
+        _record_event(cfg.market, "BUY_BLOCKED", time_str, detail=msg)
+        return new_account, krw_budget, False
+
+    logger.info(
+        f"[{cfg.market}] [REBALANCE] {source_market} 50% 매도 완료 "
+        f"secured_krw={krw_budget:,}"
+    )
+    return new_account, krw_budget, True
 
 
 def trade_one_market(cfg: MarketConfig, now: datetime, account: dict
@@ -1354,17 +1515,27 @@ def trade_one_market(cfg: MarketConfig, now: datetime, account: dict
     state["last_entry_signal_candle"] = signal_candle
     save_state(cfg, state)
 
-    # 매수 가능 KRW 결정: 최대 2개 동시 보유를 위해 남은 슬롯 수로 가용 KRW를 배분한다.
+    # 매수 가능 KRW 결정: 0개 보유는 전액, 1개 보유는 수익 포지션 50% 리밸런싱 확보금만 사용한다.
     krw_use, active_positions, remaining_slots = _buy_budget_krw(account)
     if remaining_slots <= 0:
         msg = f"동시 보유 한도 도달({active_positions}/{MAX_CONCURRENT_POSITIONS})"
         logger.warning(f"[{cfg.market}] {msg}")
+        send_telegram(_msg_fail(cfg, now, "매수", msg))
         _record_event(cfg.market, "BUY_BLOCKED", time_str, detail=msg)
         return account, state, cur_price, indic
 
+    buy_label = "매수 체결"
+    buy_note = "매수방식: 보유 0개, 가용 KRW 전액"
+    if active_positions == 1:
+        account, krw_use, can_buy = _try_rebalance_for_new_buy(cfg, now, account, time_str)
+        if not can_buy:
+            return account, state, cur_price, indic
+        buy_label = "리밸런싱 확보금 매수"
+        buy_note = "매수방식: 기존 수익 포지션 50% 매도 확보금"
+
     if krw_use < MIN_ORDER_KRW:
         msg = (
-            f"슬롯 배분 매수금액({krw_use:,}원) < 최소주문({MIN_ORDER_KRW:,}원) "
+            f"매수금액({krw_use:,}원) < 최소주문({MIN_ORDER_KRW:,}원) "
             f"(보유 {active_positions}/{MAX_CONCURRENT_POSITIONS})"
         )
         logger.warning(f"[{cfg.market}] {msg}")
@@ -1406,9 +1577,9 @@ def trade_one_market(cfg: MarketConfig, now: datetime, account: dict
             })
         save_state(cfg, new_state)
         send_telegram(_msg_buy(cfg, now, actual_buy, krw_use, actual_qty,
-                                account["krw_balance"]))
+                                account["krw_balance"], buy_label, buy_note))
         _record_event(cfg.market, "BUY", time_str,
-                      price=actual_buy, krw_used=krw_use)
+                      price=actual_buy, krw_used=krw_use, label=buy_label)
         logger.info(
             f"[{cfg.market}] [BUY] {krw_use:,}원 매수 완료  avg_buy_price={actual_buy:.5f}  "
             f"slots_before={active_positions}/{MAX_CONCURRENT_POSITIONS} remaining={remaining_slots}"
